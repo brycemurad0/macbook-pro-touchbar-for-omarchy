@@ -29,46 +29,54 @@ jumps to its session; tapping the ASCII field around it dismisses it.
 
 ## Voice (optional)
 
-`pipecat_voice.py` is a live voice agent on
-[Pipecat](https://github.com/pipecat-ai/pipecat): the framework owns
-turn-taking (Silero VAD, end-of-turn, barge-in), and this repo owns
-the machine — PipeWire mic/speaker transports (no inbound exposure;
-every connection is outbound), a Gemini brain with function calling,
-ElevenLabs TTS for the voice itself, and `voice_tools.py`, the local
-tool layer the brain calls: fleet sessions/status, Mnemos memory
-recall + remember, shell here or on any fleet node, Second Brain
-search, daily brief, window focus, URL open, clipboard, reminders,
-media. Quick checks answer by voice; real work follows a spoken
+`voice_daemon.py` is the voice entrypoint: it reads `voice.json`,
+picks a backend, and supervises it. Backends, in `auto` order:
+
+1. **OpenAI Realtime** (`voice_openai.py`) — `gpt-realtime`,
+   native voice-to-voice with function calling. Primary pick.
+2. **Gemini Live** (`voice_gemini.py`) — Google's native live
+   voice model, same tools. The funded fallback.
+3. **ElevenLabs hosted agent** (`voice_elevenlabs.py`) — Sarah's
+   voice; the hosted agent is re-rendered from `voice.json` on
+   every start, and this thin client just pumps mic/speaker and
+   executes its client tool calls locally.
+4. **Local cascade** (`pipecat_voice.py`) — Pipecat owns
+   turn-taking (Silero VAD, end-of-turn, barge-in); PipeWire
+   transports, Moonshine STT (local), a provider-chain brain
+   (`brain_models`: minimax / gemini / kimi / openai / anthropic /
+   openrouter, each joining only when its key exists), and
+   ElevenLabs TTS.
+
+If a native backend exits with code 42 (key rejected or credits
+exhausted), the launcher falls through to the next backend, so an
+OpenAI-primary setup rolls over to Gemini mid-toggle instead of
+going silent. Dropping a key into `voice-secrets.env` (mode 600,
+never committed) is the whole setup for any of them:
+`OPENAI_API_KEY`, `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`,
+`MINIMAX_API_KEY`, `KIMI_API_KEY`.
+
+**Everything voice-shaped is one file: `voice.json`** — the
+backend pick and per-backend model/voice, the cascade brain
+chain, the persona prompt (short, sweet, dry wit;
+`{{node}}`/`{{time}}`/`{{fleet}}`/`{{brain}}` are filled in live
+by whichever backend is speaking), the greeting line, and the
+tool schemas. `voice_tools.py` is the shared local tool layer
+every backend calls: fleet sessions/status, Mnemos memory recall
++ remember, shell here or on any fleet node, Second Brain search,
+daily brief, window focus, URL open, clipboard, reminders, media.
+Quick checks answer by voice; real work follows a spoken
 protocol — the agent restates the goal, names the harness, asks
-*"Want me to run that?"*, and only on a yes launches `start_work`
-(a permissionless coding harness in the background) and reports
-once when it finishes. Toggle it from FLOW's pod.
+*"Want me to run that?"*, and only on a yes launches `start_work`.
+That confirm-before-work rule is enforced in `voice_tools.py`,
+not just requested in the prompt: a first `start_work` call only
+stages the job, which launches when the same goal is called again
+after the user has answered (or when the agent already asked
+verbally and the user said yes). Jobs run **locally** on this
+machine via a permissionless coding harness, detached and
+registered on disk (`jobs.json`), so voice restarts neither kill
+nor lose them; the agent announces each finish once. Toggle
+voice from FLOW's pod.
 
-Pipeline: `pw-record` → Silero VAD → Moonshine STT (local, no audio
-leaves the box) → Gemini (brain) → ElevenLabs TTS → `pw-cat` to the
-speaker. The mic is ducked (not muted) while the agent speaks, so
-speaker echo can't self-trigger but a real voice can still barge in.
-
-**Everything voice-shaped is one file: `voice.json`** — the brain
-model chain, ElevenLabs voice id + model, the persona prompt
-(short, sweet, dry wit; `{{node}}`/`{{time}}`/`{{fleet}}` are filled
-in live), the greeting line, and the 17 tool schemas. Keys live only
-in `voice-secrets.env` (mode 600, never committed):
-`ELEVENLABS_API_KEY` and `GEMINI_API_KEY`.
-
-The brain is a **failover chain** (`brain_models`, first = your
-pick). Entries are `provider:model` — `google` (bare names work
-too), `anthropic`, `openai`, `openrouter` — and each provider joins
-only when its key exists in `voice-secrets.env`
-(`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`OPENROUTER_API_KEY`), so adding a brain later is a key drop, not a
-code change. This matters because metered free tiers are tiny
-(Gemini's good Flash models allow ~20 requests/day): a 429/503 or a
-stall benches that model and the conversation re-asks on the next,
-with patient background retries and one honest spoken status line
-instead of silence when the whole chain is down. The greeting is
-spoken locally and never waits on a brain. If a turn takes a
-moment, the agent says "One sec." rather than leaving dead air.
 Every conversation appends one numeric metrics row (turns, words,
 agent characters, latency, tool calls) to
 `~/.local/state/omarchy-touchbar/voice-metrics.jsonl`.

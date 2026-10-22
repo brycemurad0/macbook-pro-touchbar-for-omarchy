@@ -78,9 +78,32 @@ _job_seq = itertools.count(1)
 _jobs_announced = set()
 
 
+def _registry_path():
+    return os.path.join(JOBS_DIR, "jobs.json")
+
+
+def _load_registry():
+    try:
+        return json.load(open(_registry_path()))
+    except Exception:
+        return {}
+
+
+def _save_registry(reg):
+    try:
+        os.makedirs(JOBS_DIR, exist_ok=True)
+        json.dump(reg, open(_registry_path(), "w"), indent=1)
+    except OSError:
+        pass
+
+
 def start_work_job(goal, harness="grok"):
+    """Launch a harness job ON THIS MACHINE (never on a fleet node —
+    the agent once claimed 'dgx-spark'; that was invented). The job
+    is detached (own session) and registered on disk, so voice
+    service restarts neither kill it nor lose track of it."""
     os.makedirs(JOBS_DIR, exist_ok=True)
-    jid = f"job-{next(_job_seq)}"
+    jid = f"job-{int(time.time())}-{next(_job_seq)}"
     prompt = (f"Goal: {goal}\n\nWork autonomously and permissionless until "
               "this goal is complete. When done, end with a concise final "
               "report (at most 5 sentences): what was done and how it "
@@ -88,9 +111,14 @@ def start_work_job(goal, harness="grok"):
     log = open(os.path.join(JOBS_DIR, f"{jid}.log"), "wb")
     proc = subprocess.Popen(
         HARNESS_CMDS.get(harness, HARNESS_CMDS["grok"]) + [prompt],
-        stdout=log, stderr=subprocess.STDOUT, cwd=os.path.expanduser("~"))
+        stdout=log, stderr=subprocess.STDOUT, cwd=os.path.expanduser("~"),
+        start_new_session=True)
     _jobs[jid] = {"proc": proc, "goal": goal, "harness": harness,
                   "log": log.name, "started": time.time()}
+    reg = _load_registry()
+    reg[jid] = {"pid": proc.pid, "goal": goal, "harness": harness,
+                "log": log.name, "started": time.time()}
+    _save_registry(reg)
     print(f"work started: {jid} on {harness}: {goal[:100]}", flush=True)
     return jid
 
@@ -105,6 +133,14 @@ def _job_outcome(job):
     return _truncate("\n".join(lines[-6:]), 700)
 
 
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 def job_states():
     out = {}
     for jid, job in _jobs.items():
@@ -114,15 +150,37 @@ def job_states():
                     "goal": job["goal"], "harness": job["harness"]}
         if rc is not None:
             out[jid]["outcome"] = _job_outcome(job)
+    # jobs started by an earlier daemon process (voice restarted
+    # mid-job): tracked by pid from the on-disk registry
+    for jid, rec in _load_registry().items():
+        if jid in out:
+            continue
+        alive = _pid_alive(rec.get("pid", 0))
+        entry = {"status": "running" if alive else "done",
+                 "goal": rec.get("goal", ""), "harness": rec.get("harness", "")}
+        if not alive:
+            entry["outcome"] = _job_outcome({"log": rec.get("log", "")})
+        out[jid] = entry
     return out
 
 
 def pop_finished_jobs():
     fresh = []
+    reg = _load_registry()
+    dirty = False
     for jid, st in job_states().items():
-        if st["status"] != "running" and jid not in _jobs_announced:
+        if st["status"] == "running" or jid in _jobs_announced:
+            continue
+        if reg.get(jid, {}).get("announced"):
             _jobs_announced.add(jid)
-            fresh.append((jid, st))
+            continue
+        _jobs_announced.add(jid)
+        if jid in reg:  # persist so restarts don't re-announce
+            reg[jid]["announced"] = True
+            dirty = True
+        fresh.append((jid, st))
+    if dirty:
+        _save_registry(reg)
     return fresh
 
 
@@ -293,7 +351,9 @@ def _start_work_tool(args):
             or _asked_then_answered():
         _pending_work["goal"] = None
         jid = start_work_job(goal, harness)
-        return (f"{jid} started on {harness}. "
+        return (f"{jid} started on {harness} on this machine "
+                f"({os.uname().nodename}) — jobs always run locally, "
+                "never on a fleet node. "
                 "Tell the user it is running in one short line, then stop "
                 "talking about it until it finishes.")
     _pending_work.update(goal=goal, harness=harness,

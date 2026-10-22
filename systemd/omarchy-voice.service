@@ -1,11 +1,11 @@
 [Unit]
-Description=Omarchy voice agent (Pipecat: Silero VAD, Moonshine STT, Gemini brain, ElevenLabs voice, local tools)
+Description=Omarchy voice agent (backend from voice.json: OpenAI Realtime / Gemini Live / ElevenLabs / local Pipecat cascade)
 After=graphical-session.target
 
 [Service]
-# Pipecat needs the project venv:
-#   python3 -m venv .venv && .venv/bin/pip install 'pipecat-ai[silero,moonshine,elevenlabs,google]'
-ExecStart=/home/USER/.config/omarchy/touchbar/.venv/bin/python /home/USER/.config/omarchy/touchbar/pipecat_voice.py
+# Needs the project venv:
+#   python3 -m venv .venv && .venv/bin/pip install 'pipecat-ai[silero,moonshine,elevenlabs,google]' google-genai websockets
+ExecStart=/home/USER/.config/omarchy/touchbar/.venv/bin/python /home/USER/.config/omarchy/touchbar/voice_daemon.py
 Restart=always
 RestartSec=3
 TimeoutStopSec=15

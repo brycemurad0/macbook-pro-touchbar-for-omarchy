@@ -420,10 +420,13 @@ def build_brain(cfg, system):
                 svc = BrainAnthropicLLM(
                     api_key=key, model=model,
                     params=AnthropicLLMService.InputParams(temperature=0.7))
-        elif provider in ("openai", "openrouter", "minimax"):
+        elif provider in ("openai", "openrouter", "minimax", "kimi"):
             key = _secret({"openai": "OPENAI_API_KEY",
                            "openrouter": "OPENROUTER_API_KEY",
-                           "minimax": "MINIMAX_API_KEY"}[provider])
+                           "minimax": "MINIMAX_API_KEY",
+                           "kimi": "KIMI_API_KEY"}[provider])
+            if provider == "kimi" and not key:
+                key = _secret("MOONSHOT_API_KEY")
             if key:
                 kw = {"api_key": key, "model": model,
                       "params": OpenAILLMService.InputParams(
@@ -441,6 +444,8 @@ def build_brain(cfg, system):
                     kw["base_url"] = "https://openrouter.ai/api/v1"
                 elif provider == "minimax":
                     kw["base_url"] = "https://api.minimax.io/v1"
+                elif provider == "kimi":
+                    kw["base_url"] = "https://api.moonshot.ai/v1"
                 svc = BrainOpenAILLM(**kw)
         if svc is None:
             print(f"brain skip {spec}: no key / unknown provider",
@@ -472,7 +477,9 @@ async def amain():
               .replace("{{node}}", os.uname().nodename)
               .replace("{{time}}", datetime.datetime.now().strftime(
                   "%A %H:%M"))
-              .replace("{{fleet}}", vt.tool_fleet_status()))
+              .replace("{{fleet}}", vt.tool_fleet_status())
+              .replace("{{brain}}", "the configured voice brain "
+                       f"({(cfg.get('brain_models') or ['local'])[0]})"))
     transport = PwTransport(TransportParams(
         audio_in_enabled=True, audio_out_enabled=True,
         audio_in_sample_rate=RATE, audio_out_sample_rate=RATE))

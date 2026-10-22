@@ -365,3 +365,24 @@ Acceptance passed end-to-end. Root causes found and fixed upstream:
   live use, the gate is the fallback - it is in git history
   (built and removed 2026-10-22, never committed; rebuild from
   this description).
+- Addendum 2026-10-22 (voice settled, owner live tour; Muse):
+  owner talked to every stack live and SETTLED: OpenAI Realtime
+  (gpt-realtime) primary, voice "cedar" (auditioned marin, coral,
+  sage, verse, ash, ballad, alloy, echo, shimmer; cedar/ash got
+  the long sessions, cedar picked). Gemini Live is the funded
+  fallback (billing enabled): voice_daemon.py supervises backends
+  and falls through on exit 42 (key/credits), order openai ->
+  gemini -> elevenlabs -> pipecat cascade; "backend": "auto" in
+  voice.json, per-backend model/voice under "backends". Persona
+  got {{brain}} so each backend names itself truthfully (Realtime
+  claimed MiniMax live), memory only when explicitly asked
+  (Gemini saved unasked), opening media is a quick action never a
+  job. Jobs: start_work_job was spawning locally all along (the
+  agent hallucinated "dgx-spark") and my voice-swap restarts
+  KILLED both owner jobs; jobs are now detached + disk-registered
+  (jobs.json, announced persisted) and survive restarts. The
+  toolkit-map job was relaunched detached after the fix.
+  elevenlabs agent is re-rendered from voice.json each start
+  (el-agent.json). Remaining known gaps: fleet_sessions misses
+  some local sessions (owner caught it twice), Spruce/Glean are
+  ChatGPT-app voices - the Realtime API rejects them.
