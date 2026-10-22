@@ -206,3 +206,50 @@ class VoiceConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfirmGateTests(unittest.TestCase):
+    """start_work must stage first and launch only after a new user
+    turn — a model calling it unconfirmed must not start anything."""
+
+    def setUp(self):
+        self._real_launch = vt.start_work_job
+        self.launched = []
+        vt.start_work_job = lambda goal, harness="grok": (
+            self.launched.append((goal, harness)), "job-99")[1]
+        vt._pending_work.update(goal=None, harness="grok", turn=-1, at=0.0)
+        vt._user_turn = 0
+
+    def tearDown(self):
+        vt.start_work_job = self._real_launch
+
+    def test_first_call_stages_without_launching(self):
+        out = vt.TOOL_FUNCS["start_work"]({"goal": "count files",
+                                           "harness": "pi"})
+        self.assertIn("STAGED", out)
+        self.assertEqual(self.launched, [])
+
+    def test_same_turn_recall_still_stages(self):
+        args = {"goal": "count files", "harness": "pi"}
+        vt.TOOL_FUNCS["start_work"](args)
+        out = vt.TOOL_FUNCS["start_work"](args)
+        self.assertIn("STAGED", out)
+        self.assertEqual(self.launched, [])
+
+    def test_call_after_new_user_turn_launches_once(self):
+        args = {"goal": "count files", "harness": "pi"}
+        vt.TOOL_FUNCS["start_work"](args)
+        vt.note_user_turn()
+        out = vt.TOOL_FUNCS["start_work"](args)
+        self.assertIn("job-99 started", out)
+        self.assertEqual(self.launched, [("count files", "pi")])
+        vt.note_user_turn()
+        vt.TOOL_FUNCS["start_work"](args)  # stages a fresh proposal
+        self.assertEqual(len(self.launched), 1)
+
+    def test_different_goal_after_turn_restages(self):
+        vt.TOOL_FUNCS["start_work"]({"goal": "count files"})
+        vt.note_user_turn()
+        out = vt.TOOL_FUNCS["start_work"]({"goal": "other job"})
+        self.assertIn("STAGED", out)
+        self.assertEqual(self.launched, [])

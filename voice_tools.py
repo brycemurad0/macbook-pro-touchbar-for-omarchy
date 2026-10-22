@@ -58,7 +58,7 @@ def _truncate(s, n=1600):
 
 
 HARNESS_CMDS = {
-    "pi": ["pi", "--provider", "meta", "--model", "muse-wonder-1.0", "-p"],
+    "pi": ["pi", "-p"],
     "grok": ["grok", "--always-approve", "-p"],
     "claude": ["claude", "-p", "--dangerously-skip-permissions"],
     "codex": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
@@ -230,14 +230,42 @@ def tool_run_shell_quick(command):
     return _truncate((out.stdout + out.stderr).strip() or "(no output)", 1200)
 
 
+# Confirm-before-work is enforced here, not just asked for in the
+# prompt: a model (MiniMax did this live) can call start_work on the
+# first turn and launch unconfirmed work. So the first call only
+# STAGES the job; it launches on a later call, with the same goal,
+# after at least one new user turn (note_user_turn) has arrived —
+# i.e. the user has actually been asked and has answered.
+_pending_work = {"goal": None, "harness": "grok", "turn": -1, "at": 0.0}
+_user_turn = 0
+
+
+def note_user_turn():
+    global _user_turn
+    _user_turn += 1
+
+
 def _start_work_tool(args):
     goal = (args.get("goal") or "").strip()
     if not goal:
         return "no goal given"
-    jid = start_work_job(goal, args.get("harness", "grok"))
-    return (f"{jid} started on {args.get('harness', 'grok')}. "
-            "Tell the user it is running in one short line, then stop "
-            "talking about it until it finishes.")
+    harness = args.get("harness", "grok")
+    p = _pending_work
+    staged = (p["goal"] or "").casefold() == goal.casefold()
+    fresh = time.time() - p["at"] < 900
+    if staged and fresh and p["turn"] < _user_turn:
+        _pending_work["goal"] = None
+        jid = start_work_job(goal, harness)
+        return (f"{jid} started on {harness}. "
+                "Tell the user it is running in one short line, then stop "
+                "talking about it until it finishes.")
+    _pending_work.update(goal=goal, harness=harness,
+                         turn=_user_turn, at=time.time())
+    return ("STAGED, not started — nothing is running yet. Now ask the "
+            "user in one short line: restate this goal crisply, name the "
+            f"harness ({harness}), and ask 'Want me to run that?' Then "
+            "STOP and wait. Only call start_work again, with this exact "
+            "goal, after the user says yes in a new turn.")
 
 
 TOOL_FUNCS = {
@@ -267,6 +295,37 @@ def _fleet_cfg():
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
+
+
+def _voice_cfg():
+    for name in ("voice.json", "voice.example.json"):
+        try:
+            with open(os.path.join(BASE_DIR, name)) as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            continue
+    return {}
+
+
+# fleet.json may override any harness launch line per machine
+# (provider/model choices are personal, not universal defaults)
+HARNESS_CMDS.update({k: list(v) for k, v in
+                     (_fleet_cfg().get("harness_cmds") or {}).items()})
+
+
+def _memory_cfg():
+    return (_voice_cfg().get("memory") or {})
+
+
+def _vault_path():
+    v = str(_memory_cfg().get("vault_path") or "").strip()
+    return os.path.expanduser(v) if v else None
+
+
+def _mnemos_container():
+    return str(_memory_cfg().get("mnemos_container") or "").strip()
 
 
 def _fleet_nodes():
@@ -303,7 +362,7 @@ def _fleet_nodes():
 
 def _resolve_node(query):
     q = (query or "").strip().lower()
-    if not q or q in ("here", "local", "this", "fred", os.uname().nodename):
+    if not q or q in ("here", "local", "this", os.uname().nodename):
         return None  # local
     for n in _fleet_nodes():
         if q in (n["label"], n["display"].lower(),
@@ -443,7 +502,7 @@ def tool_node_shell(node_query, command):
     return _truncate(out or "(no output)", 1200)
 
 
-BRAIN = os.path.expanduser("~/brain")
+VAULT = _vault_path()  # voice.json memory.vault_path; None = unconfigured
 
 
 def _age_note(path):
@@ -459,8 +518,10 @@ def _age_note(path):
 
 
 def tool_daily_brief():
+    if not VAULT:
+        return "no notes vault configured (memory.vault_path in voice.json)"
     bits = []
-    truth = os.path.join(BRAIN, "operations/CURRENT-TRUTH.md")
+    truth = os.path.join(VAULT, "operations/CURRENT-TRUTH.md")
     try:
         with open(truth) as f:
             bits.append(f"Current truth [as of {_age_note(truth)}]:\n"
@@ -469,7 +530,7 @@ def tool_daily_brief():
         pass
     try:
         import glob
-        days = sorted(glob.glob(os.path.join(BRAIN, "logs/daily/*.md")))
+        days = sorted(glob.glob(os.path.join(VAULT, "logs/daily/*.md")))
         if days:
             with open(days[-1]) as f:
                 bits.append(
@@ -483,14 +544,14 @@ def tool_daily_brief():
 
 
 def tool_brain_search(query):
-    if not os.path.isdir(BRAIN):
-        return "no Second Brain vault found on this machine"
+    if not VAULT or not os.path.isdir(VAULT):
+        return "no notes vault configured (memory.vault_path in voice.json)"
     try:
         proc = subprocess.run(
             ["rg", "-i", "-n", "-m", "2", "--glob", "*.md",
              "--glob", "!**/_archive/**", "--glob", "!**/history/**",
              "--glob", "!**/openclaw-imports/**", "--glob", "!**/legacy*/**",
-             query, BRAIN], capture_output=True, text=True, timeout=12)
+             query, VAULT], capture_output=True, text=True, timeout=12)
     except Exception as exc:
         return f"search failed: {exc}"
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
@@ -522,7 +583,7 @@ TOOL_FUNCS.update({
 })
 
 
-MNEMOS_CONTAINER = "cortex/agent-context/second-brain"
+
 
 
 def _mnemos_url_token():
@@ -560,10 +621,13 @@ def _mnemos_url_token():
 
 
 def tool_memory_search(query):
+    if not _mnemos_container():
+        return "mnemos not configured (memory.mnemos_container in voice.json)"
     url, token = _mnemos_url_token()
     if not token:
         return "mnemos token not available on this machine"
-    body = json.dumps({"query": query, "container_tag": MNEMOS_CONTAINER,
+    body = json.dumps({"query": query,
+                       "container_tag": _mnemos_container(),
                        "limit": 6, "rerank": True}).encode()
     req = urllib.request.Request(
         f"{url}/recall", data=body, method="POST",
@@ -602,11 +666,13 @@ TOOL_FUNCS["memory_search"] = lambda a: tool_memory_search(
 
 
 def tool_remember(fact):
+    if not _mnemos_container():
+        return "mnemos not configured (memory.mnemos_container in voice.json)"
     url, token = _mnemos_url_token()
     if not token:
         return "mnemos token not available on this machine"
     body = json.dumps({
-        "raw_text": fact, "container_tag": MNEMOS_CONTAINER,
+        "raw_text": fact, "container_tag": _mnemos_container(),
         "memory_type": "episodic", "actor_id": "omarchy-voice",
         "source_provider": "omarchy-voice"}).encode()
     req = urllib.request.Request(
@@ -680,7 +746,7 @@ def resolve_elevenlabs_key():
 
 
 def _gain_pcm(raw, gain):
-    """Mic gain: the J293 mic arrives quiet (~-50 dBFS speech), low
+    """Mic gain: the built-in mic arrives quiet (~-50 dBFS speech), low
     enough that server VAD ignored it entirely. Boost with clamping."""
     if gain == 1.0 or not raw:
         return raw

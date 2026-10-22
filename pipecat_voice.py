@@ -247,6 +247,7 @@ class HeardObserver(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             print("heard:", frame.text[:200], flush=True)
+            vt.note_user_turn()
             self.metrics.note_speech()
             self.metrics.user_spoke(frame.text)
             self.health["awaiting"] = True

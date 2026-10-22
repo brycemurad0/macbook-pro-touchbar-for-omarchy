@@ -295,3 +295,29 @@ Acceptance passed end-to-end. Root causes found and fixed upstream:
   so answers can land late at night. Enabling billing on the Gemini
   project is the durable fix (owner call). Owner spoken acceptance
   is still the finish line; service left STOPPED for their toggle.
+- Addendum 2026-10-22 (MiniMax brain + confirm gate, Muse): the
+  flaky Gemini-free-tier lead is replaced. Owner-provided MiniMax
+  subscription key lives only in voice-secrets.env (600); chain is
+  now minimax:MiniMax-M3.1-Flash -> gemini-3.8-flash ->
+  gemini-3.5-flash -> gemini-3.1-flash-lite. Key probed on the
+  OpenAI-compatible route (api.minimax.io/v1): auth OK and correct
+  function calling with the full 17-tool schema. Full synthetic
+  conversation 12/12 (greeting, fleet tool, remember + banana
+  recall, spoken confirm question, launch after yes only, spoken
+  job report, 0.9s pause held, reply audio on speaker). BUT:
+  MiniMax ignored the prompt-level confirm protocol and launched
+  start_work unconfirmed, so the protocol is now enforced in code
+  (voice_tools._start_work_tool): first call only STAGES; launch
+  needs the same goal called again after a new user turn
+  (pipecat_voice HeardObserver -> vt.note_user_turn). 4 gate unit
+  tests; suite 34/34 both orders + fresh discover. Systemd start
+  verified (brain chain log + greeting), stopped clean for the
+  owner's toggle. Owner spoken acceptance still the finish line.
+  Machine notes: gnome-keyring-daemon crashed exactly once
+  (04:44 SIGABRT, duplicate-daemon race, "Secret Service already
+  initialized"); the current daemon has run 7h+ since - the hourly
+  "already registered" lines are warnings, not crashes, and no
+  touchbar/voice code touches Secret Service (keys are the env
+  file). The actual recurring crasher was voxtype.service: binary
+  /usr/bin/voxtype missing, Restart=on-failure every 5s, 11,856
+  restarts - disabled --now; reinstall voxtype to revive it.
