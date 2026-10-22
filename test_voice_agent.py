@@ -79,6 +79,47 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(len(m.latencies), 1)
 
 
+class WiringCTests(unittest.TestCase):
+    def test_vad_segments_on_energy(self):
+        seg = va.VadSegmenter(thresh=100, hang_frames=3, min_frames=3)
+        quiet = b"\x00" * 3200
+        loud = struct.pack("<1600h", *([900] * 1600))
+        self.assertIsNone(seg.feed(quiet))
+        self.assertIsNone(seg.feed(loud))
+        self.assertIsNone(seg.feed(loud))
+        self.assertIsNone(seg.feed(loud))
+        self.assertIsNone(seg.feed(quiet))
+        self.assertIsNone(seg.feed(quiet))
+        out = seg.feed(quiet)  # third quiet frame closes the segment
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out), 6 * 3200)  # speech + hang frames
+
+    def test_vad_ignores_blips(self):
+        seg = va.VadSegmenter(thresh=100, hang_frames=2, min_frames=4)
+        loud = struct.pack("<1600h", *([900] * 1600))
+        quiet = b"\x00" * 3200
+        seg.feed(loud)
+        seg.feed(quiet)
+        self.assertIsNone(seg.feed(quiet))  # too short: dropped
+
+    def test_gemini_schema_conversion(self):
+        out = va._schema_to_gemini({
+            "type": "object",
+            "properties": {"node": {"type": "string",
+                                    "description": "n"},
+                           "minutes": {"type": "integer"}},
+            "required": ["node"]})
+        self.assertEqual(out["type"], "OBJECT")
+        self.assertEqual(out["properties"]["node"]["type"], "STRING")
+        self.assertEqual(out["properties"]["minutes"]["type"], "INTEGER")
+        self.assertEqual(out["required"], ["node"])
+
+    def test_sentence_split(self):
+        self.assertEqual(va._split_sentences("One. Two? Three! Four"),
+                         ["One.", "Two?", "Three!", "Four"])
+        self.assertEqual(va._split_sentences(""), [])
+
+
 class ProfileTests(unittest.TestCase):
     def test_profile_shape_and_persona_rules(self):
         path = os.path.join(BASE, "agent-profile.json")
@@ -143,6 +184,34 @@ class ProfileTests(unittest.TestCase):
         if node == "unknown":
             self.skipTest("fleet not enumerable in this environment")
         self.assertIn(node["display"].lower(), ("bob",))
+
+
+class PersonaAndToolsTests(unittest.TestCase):
+    """The Pipecat daemon renders its brain from agent-profile.json:
+    persona traits and the tool surface are contract, not folklore."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.profile = json.load(open(os.path.join(BASE, "agent-profile.json")))
+
+    def test_persona_is_short_sweet_dry(self):
+        prompt = self.profile["prompt"].lower()
+        for trait in ("short", "dry", "wit"):
+            self.assertIn(trait, prompt)
+        self.assertTrue(self.profile["first_message"].strip())
+
+    def test_every_profile_tool_has_a_local_impl(self):
+        names = {t["name"] for t in self.profile["tools"]}
+        self.assertGreaterEqual(len(names), 15)
+        self.assertEqual(names - set(va.EL_TOOL_FUNCS), set())
+
+    def test_tool_schemas_are_gemini_shaped(self):
+        for t in self.profile["tools"]:
+            params = t.get("parameters") or {}
+            for prop, spec in (params.get("properties") or {}).items():
+                self.assertIn("type", spec, f"{t['name']}.{prop}")
+            for req in params.get("required") or []:
+                self.assertIn(req, params.get("properties") or {})
 
 
 if __name__ == "__main__":
