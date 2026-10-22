@@ -28,16 +28,20 @@ jumps to its session; tapping the ASCII field around it dismisses it.
 
 ## Voice (optional)
 
-`voice_agent.py` is a native speech-to-speech client (xAI Grok Voice
-by default; OpenAI Realtime also works) with local tool calling:
-fleet status, shell, window focus, URL open, and delegation to coding
-harnesses — multi-step work routes to a coordinator harness. It reads
-credentials from environment / `~/.config/grok-voice/secrets.env`, or
-refreshes the OAuth token pi already stores. Toggle it from FLOW.
-
-Copy `voice-config.example.json` to
-`~/.config/omarchy/touchbar/voice-config.json` and set provider,
-model (`grok-voice-latest` recommended), and voice.
+`voice_agent.py` is a live voice agent client. Default backend is
+ElevenLabs Conversational AI (ASR → LLM → TTS pipeline): persona,
+voice, and brain are versioned in `agent-profile.example.json` and
+applied with `apply_agent.py`; the daemon keeps PipeWire mic/speaker
+I/O and executes the agent's client tools locally — quick checks
+(fleet status, shell, window focus, URL open) answer by voice, while
+real work is restated as a goal, confirmed out loud, then run
+permissionless in the background by a coding harness (`start_work`)
+and reported once when done. Put `ELEVENLABS_API_KEY` in
+`~/.config/omarchy/touchbar/voice-secrets.env`, run
+`python3 apply_agent.py`, copy `voice-config.example.json` to
+`~/.config/omarchy/touchbar/voice-config.json`. Toggle it from FLOW.
+xAI Grok Voice (native speech-to-speech) remains available as
+`provider: grok`.
 
 ## Install
 

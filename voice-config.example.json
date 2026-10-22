@@ -1,5 +1,5 @@
 {
-  "provider": "grok",
-  "model": "grok-voice-latest",
-  "voice": "ara"
+  "provider": "elevenlabs",
+  "agent_id": "agent_xxxxxxxx",
+  "voice": null
 }

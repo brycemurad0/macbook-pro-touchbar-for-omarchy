@@ -22,9 +22,11 @@ State -> ~/.local/state/omarchy-touchbar/voice.json (touchbar switch).
 """
 import asyncio
 import base64
+import itertools
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -210,18 +212,87 @@ def _truncate(s, n=1600):
     return s[-n:] if len(s) > n else s
 
 
+HARNESS_CMDS = {
+    "pi": ["pi", "--provider", "meta", "--model", "muse-wonder-1.0", "-p"],
+    "grok": ["grok", "--always-approve", "-p"],
+    "claude": ["claude", "-p", "--dangerously-skip-permissions"],
+    "codex": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
+    "opencode": ["opencode", "run"],
+}
+
+
 def tool_delegate(task, harness="pi"):
-    cmds = {
-        "pi": ["pi", "--provider", "meta", "--model", "muse-wonder-1.0", "-p", task],
-        "grok": ["grok", "--always-approve", "-p", task],
-        "claude": ["claude", "-p", "--dangerously-skip-permissions", task],
-        "codex": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", task],
-        "opencode": ["opencode", "run", task],
-    }
-    cmd = cmds.get(harness, cmds["pi"])
+    cmd = HARNESS_CMDS.get(harness, HARNESS_CMDS["pi"]) + [task]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
                          cwd=os.path.expanduser("~"))
     return _truncate((out.stdout or out.stderr or "done").strip())
+
+
+# ------------------------------------------------------- background jobs
+# Voice confirms a goal out loud first; only then does start_work launch
+# a harness, permissionless, in the background. The voice layer never
+# blocks on it: completion is announced back into the conversation.
+JOBS_DIR = os.path.expanduser("~/.local/state/omarchy-touchbar/jobs")
+_jobs = {}
+_job_seq = itertools.count(1)
+_jobs_announced = set()
+
+
+def start_work_job(goal, harness="grok"):
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    jid = f"job-{next(_job_seq)}"
+    prompt = (f"Goal: {goal}\n\nWork autonomously and permissionless until "
+              "this goal is complete. When done, end with a concise final "
+              "report (at most 5 sentences): what was done and how it "
+              "was verified.")
+    log = open(os.path.join(JOBS_DIR, f"{jid}.log"), "wb")
+    proc = subprocess.Popen(
+        HARNESS_CMDS.get(harness, HARNESS_CMDS["grok"]) + [prompt],
+        stdout=log, stderr=subprocess.STDOUT, cwd=os.path.expanduser("~"))
+    _jobs[jid] = {"proc": proc, "goal": goal, "harness": harness,
+                  "log": log.name, "started": time.time()}
+    print(f"work started: {jid} on {harness}: {goal[:100]}", flush=True)
+    return jid
+
+
+def _job_outcome(job):
+    try:
+        with open(job["log"], errors="replace") as f:
+            text = f.read().strip()
+    except OSError:
+        return ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return _truncate("\n".join(lines[-6:]), 700)
+
+
+def job_states():
+    out = {}
+    for jid, job in _jobs.items():
+        rc = job["proc"].poll()
+        out[jid] = {"status": "running" if rc is None
+                    else ("done" if rc == 0 else "failed"),
+                    "goal": job["goal"], "harness": job["harness"]}
+        if rc is not None:
+            out[jid]["outcome"] = _job_outcome(job)
+    return out
+
+
+def pop_finished_jobs():
+    fresh = []
+    for jid, st in job_states().items():
+        if st["status"] != "running" and jid not in _jobs_announced:
+            _jobs_announced.add(jid)
+            fresh.append((jid, st))
+    return fresh
+
+
+def tool_work_status():
+    states = job_states()
+    if not states:
+        return "no background jobs this session"
+    return "; ".join(
+        f"{jid} ({s['harness']}, {s['status']}): {s['goal'][:80]}"
+        for jid, s in states.items())
 
 
 def tool_run_shell(command):
@@ -318,6 +389,56 @@ TOOL_FUNCS = {"delegate": lambda a: tool_delegate(a.get("task", ""), a.get("harn
               "focus_window": lambda a: tool_focus_window(a.get("query", "")),
               "open_url": lambda a: tool_open_url(a.get("url", "")),
               "fleet_status": lambda a: tool_fleet_status()}
+
+
+def tool_run_shell_quick(command):
+    out = subprocess.run(["bash", "-lc", command], capture_output=True,
+                         text=True, timeout=25, cwd=os.path.expanduser("~"))
+    return _truncate((out.stdout + out.stderr).strip() or "(no output)", 1200)
+
+
+def _start_work_tool(args):
+    goal = (args.get("goal") or "").strip()
+    if not goal:
+        return "no goal given"
+    jid = start_work_job(goal, args.get("harness", "grok"))
+    return (f"{jid} started on {args.get('harness', 'grok')}. "
+            "Tell the user it is running in one short line, then stop "
+            "talking about it until it finishes.")
+
+
+EL_TOOL_FUNCS = {
+    "fleet_status": lambda a: tool_fleet_status(),
+    "run_shell": lambda a: tool_run_shell_quick(a.get("command", "")),
+    "focus_window": lambda a: tool_focus_window(a.get("query", "")),
+    "open_url": lambda a: tool_open_url(a.get("url", "")),
+    "start_work": _start_work_tool,
+    "work_status": lambda a: tool_work_status(),
+}
+
+
+def resolve_elevenlabs_key():
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        return os.environ["ELEVENLABS_API_KEY"]
+    try:
+        for line in open(SECRETS_ENV):
+            if line.startswith("ELEVENLABS_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def _gain_pcm(raw, gain):
+    """Mic gain: the J293 mic arrives quiet (~-50 dBFS speech), low
+    enough that server VAD ignored it entirely. Boost with clamping."""
+    if gain == 1.0 or not raw:
+        return raw
+    n = len(raw) // 2
+    samples = struct.unpack(f"<{n}h", raw[:n * 2])
+    out = struct.pack(f"<{n}h", *(
+        max(-32768, min(32767, int(s * gain))) for s in samples))
+    return out + raw[n * 2:]
 
 
 # ---------------------------------------------------------------- realtime
@@ -496,6 +617,7 @@ class VoiceSession:
                     print("greeting cancelled; re-requesting", flush=True)
                     await self.ws.send(json.dumps({"type": "response.create"}))
                 self._resp_audio = 0
+                self.status = "listening"
                 set_state(True, "listening")
             elif t == "error":
                 print("provider error:", str(ev)[:300], flush=True)
@@ -571,9 +693,243 @@ class VoiceSession:
                     delay = min(delay * 2, 60)
 
 
+# ------------------------------------------------------------- elevenlabs
+EL_RATE = 16000
+
+
+class ElevenLabsSession:
+    """ElevenLabs Conversational AI client: their ASR/turn-taking/LLM/TTS
+    pipeline over one WebSocket; this process owns PipeWire I/O, the
+    touchbar state file, and local client-tool execution. Persona, voice
+    and brain live in the agent profile (agent-profile.json, applied by
+    apply_agent.py); live context goes in as dynamic variables."""
+
+    _speaker_target = staticmethod(VoiceSession._speaker_target)
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ws = None
+        self.player = None
+        self.mic_proc = None
+        self.status = "listening"
+        self.closed = False
+        self._last_audio = 0.0
+        self._out_rate = EL_RATE
+        self._announcer_live = False
+
+    def _st(self, status):
+        self.status = status
+        set_state(True, status)
+
+    @property
+    def speaking(self):
+        return time.time() - self._last_audio < 0.45
+
+    def _start_player(self):
+        args = ["pw-cat", "--playback", "--raw", "--rate", str(self._out_rate),
+                "--channels", "1", "--format", "s16"]
+        target = VoiceSession._speaker_target()
+        if target:
+            args += ["--target", target]
+        args.append("-")
+        self.player = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        print(f"player started (rate={self._out_rate} target={target})",
+              flush=True)
+
+    def _stop_player(self):
+        try:
+            if self.player:
+                self.player.terminate()
+        except Exception:
+            pass
+        self.player = None
+
+    def _flush_player(self):
+        # user barged in: drop everything queued for the speakers
+        self._stop_player()
+        self._last_audio = 0.0
+
+    async def mic_loop(self):
+        while not self.closed:
+            proc = await asyncio.create_subprocess_exec(
+                "pw-record", "--rate", str(EL_RATE), "--channels", "1",
+                "--format", "s16", "-",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            self.mic_proc = proc
+            try:
+                while not self.closed:
+                    raw = await proc.stdout.read(4096)
+                    if not raw:
+                        print("mic stream ended; respawning capture", flush=True)
+                        break
+                    # duck hard while the agent speaks: no echo canceller
+                    # on this path, full-level speaker echo would make it
+                    # interrupt itself; a loud real voice still gets in
+                    gain = 0.12 if self.speaking else 2.2
+                    await self.ws.send(json.dumps({
+                        "user_audio_chunk":
+                        base64.b64encode(_gain_pcm(raw, gain)).decode()}))
+            except Exception as exc:
+                print(f"mic loop interrupted: {exc}", flush=True)
+            finally:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            if not self.closed:
+                await asyncio.sleep(0.8)
+
+    async def _run_tool(self, call):
+        name = call.get("tool_name", "")
+        call_id = call.get("tool_call_id", "")
+        args = call.get("parameters") or {}
+        print(f"tool call: {name} {str(args)[:120]}", flush=True)
+        self._st(f"tool: {name}")
+        func = EL_TOOL_FUNCS.get(name)
+        try:
+            result = await asyncio.to_thread(func, args) if func \
+                else "unknown tool"
+            is_error = False
+        except Exception as exc:
+            result, is_error = f"tool failed: {exc}", True
+        if call.get("expects_response", True):
+            await self.ws.send(json.dumps({
+                "type": "client_tool_result", "tool_call_id": call_id,
+                "result": str(result)[:4000], "is_error": is_error}))
+        self._st("listening")
+
+    async def event_loop(self):
+        async for raw in self.ws:
+            ev = json.loads(raw)
+            t = ev.get("type", "")
+            if t == "conversation_initiation_metadata":
+                meta = ev.get("conversation_initiation_metadata_event") or {}
+                fmt = meta.get("agent_output_audio_format", "")
+                if fmt.startswith("pcm_"):
+                    self._out_rate = int(fmt.split("_")[1])
+                print(f"elevenlabs conversation {meta.get('conversation_id')} "
+                      f"(out={fmt})", flush=True)
+                self._announcer_live = True
+                self._st("listening")
+            elif t == "audio":
+                audio = (ev.get("audio_event") or {}).get("audio_base_64", "")
+                if not audio:
+                    continue
+                self._last_audio = time.time()
+                if self.player is None or self.player.poll() is not None:
+                    self._start_player()
+                try:
+                    self.player.stdin.write(base64.b64decode(audio))
+                    self.player.stdin.flush()
+                except Exception as exc:
+                    print(f"player write failed: {exc}", flush=True)
+                    self._start_player()
+            elif t == "agent_response":
+                print("assistant:", ((ev.get("agent_response_event") or {})
+                                     .get("agent_response") or "")[:200],
+                      flush=True)
+            elif t == "user_transcript":
+                print("heard:", ((ev.get("user_transcription_event") or {})
+                                 .get("user_transcript") or "")[:200],
+                      flush=True)
+            elif t == "interruption":
+                self._flush_player()
+            elif t == "ping":
+                event_id = (ev.get("ping_event") or {}).get("event_id")
+                await self.ws.send(json.dumps(
+                    {"type": "pong", "event_id": event_id}))
+            elif t == "client_tool_call":
+                await self._run_tool(ev.get("client_tool_call") or {})
+            elif t in ("agent_response_correction", "vad_score"):
+                pass
+            elif t == "error":
+                print("elevenlabs error:", str(ev)[:300], flush=True)
+                self._st("provider error")
+
+    async def _announcer(self):
+        # finished background work is reported once, in character:
+        # silent context first, then a system-flavoured user message so
+        # the agent speaks the outcome without being asked
+        while not self.closed:
+            await asyncio.sleep(4)
+            if not self._announcer_live or self.ws is None:
+                continue
+            for jid, st in pop_finished_jobs():
+                text = (f"Background job {jid} ({st['goal'][:80]}) "
+                        f"{st['status']}. Result: {st.get('outcome', '')}")
+                try:
+                    await self.ws.send(json.dumps(
+                        {"type": "contextual_update", "text": text}))
+                    await self.ws.send(json.dumps({
+                        "type": "user_message",
+                        "text": f"[{text}] Report this outcome to me now "
+                                "in one or two short sentences."}))
+                    print(f"announced {jid}: {st['status']}", flush=True)
+                except Exception as exc:
+                    print(f"announce failed: {exc}", flush=True)
+
+    async def _heartbeat(self):
+        while not self.closed:
+            set_state(True, "speaking" if self.speaking else self.status
+                      if self.status.startswith("tool") else "listening")
+            await asyncio.sleep(3)
+
+    def _signed_url(self, key, agent_id):
+        req = urllib.request.Request(
+            "https://api.elevenlabs.io/v1/convai/conversation/"
+            f"get-signed-url?agent_id={urllib.parse.quote(agent_id)}",
+            headers={"xi-api-key": key})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.load(resp)["signed_url"]
+
+    async def run(self):
+        delay = 3
+        while not self.closed:
+            self.cfg = load_config()
+            key = resolve_elevenlabs_key()
+            agent_id = self.cfg.get("agent_id")
+            if not key or not agent_id:
+                self._st("sign-in needed")
+                print("elevenlabs needs ELEVENLABS_API_KEY in "
+                      "voice-secrets.env and agent_id in voice-config.json "
+                      "(run apply_agent.py); waiting", flush=True)
+                await asyncio.sleep(30)
+                continue
+            try:
+                self._st("connecting")
+                url = await asyncio.to_thread(self._signed_url, key, agent_id)
+                async with websockets.connect(url, open_timeout=15) as ws:
+                    self.ws = ws
+                    delay = 3
+                    print("connected to elevenlabs voice", flush=True)
+                    import datetime
+                    await ws.send(json.dumps({
+                        "type": "conversation_initiation_client_data",
+                        "dynamic_variables": {
+                            "node": os.uname().nodename,
+                            "time": datetime.datetime.now().strftime(
+                                "%A %H:%M"),
+                            "fleet": tool_fleet_status()}}))
+                    await asyncio.gather(self.mic_loop(), self.event_loop(),
+                                         self._announcer(), self._heartbeat())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"elevenlabs session dropped ({exc}); reconnecting",
+                      flush=True)
+                self._announcer_live = False
+                self._stop_player()
+                if not self.closed:
+                    self._st("reconnecting")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 60)
+
+
 async def _amain():
     cfg = load_config()
-    session = VoiceSession(cfg)
+    session = ElevenLabsSession(cfg) \
+        if cfg.get("provider") == "elevenlabs" else VoiceSession(cfg)
     print("speaker target:", session._speaker_target(), flush=True)
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(session.run())
