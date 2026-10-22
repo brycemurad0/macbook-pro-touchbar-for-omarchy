@@ -1,4 +1,4 @@
-# Handoff: MacBook Pro Touch Bar for Omarchy
+# Handoff: omarchy-touchbar (M1 MacBook Pro Touch Bar)
 
 Goal: a living Touch Bar for Omarchy — ASCII pinwheel flow behind every view, functional
 controls, tap-to-focus sessions (local + fleet), a DEV launcher (node × harness → tmux →
@@ -273,3 +273,25 @@ Acceptance passed end-to-end. Root causes found and fixed upstream:
   (`podclose`) that folds the pod - the corner previously closed it
   invisibly. Test hooks: `OMARCHY_VOICE_MIC`/`OMARCHY_VOICE_SPK`
   override the pw-record/pw-cat targets for virtual-mic tests.
+- Addendum 2026-10-22 (cleanup + proof, Muse): the config cleanup
+  above is DONE locally and in the public repo - renamed to
+  brycemurad0/macbook-pro-touchbar-for-omarchy (PUBLIC). Deleted:
+  host ElevenLabs agent (API 204, verified 404), Funnel, bridge unit
+  + secret. Personal specifics moved to config: harness launch lines
+  + local pi line (fleet.json harness_cmds/local_pi_cmd), vault path
+  + Mnemos container (voice.json memory), ghost tailnet nodes
+  (fleet.json hide_nodes). Tests 29/29 both orders and from a fresh
+  clone. Voice PROVEN end-to-end with synthetic owner speech (the
+  owner authorized self-tests; rig: null-sink + virtual-source,
+  OMARCHY_VOICE_MIC): greeting, no self-talk, fleet answer, banana
+  context recall, EXACT confirm-before-work ("Want me to run that?"),
+  start_work on pi, spoken job report, 0.9s pause held into one
+  battery answer, reply audio measured on the sink (peak 20328).
+  Persona hardened: memory is a tool, not a promise. Gemma floor
+  REJECTED (streams chat, tool turns die on completion timeout).
+  Remaining risk is substrate, not code: Gemini free tier (3.8 =
+  20 req/day) 429s and 3.1-lite 503-flaps for minutes at a time; the
+  chain benches bad models (incl. timeouts) and retries patiently,
+  so answers can land late at night. Enabling billing on the Gemini
+  project is the durable fix (owner call). Owner spoken acceptance
+  is still the finish line; service left STOPPED for their toggle.
