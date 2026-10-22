@@ -76,7 +76,7 @@ HARNESS_CMD = {
     "grok": "grok --always-approve",
     "hermes": "hermes",
 }
-LOCAL_PI_CMD = "pi --provider meta --model muse-wonder-1.0"
+LOCAL_PI_CMD = "pi -p"  # fleet.json "local_pi_cmd" overrides per machine
 # Optional per-machine fleet naming, kept out of the public source:
 # ~/.config/omarchy/touchbar/fleet.json may define
 # {"node_aliases": {"dns-label": "Display Name"},
@@ -99,6 +99,8 @@ SSH_ALIASES = _FLEET_CFG.get("ssh_aliases") or {}
 # DNS labels never shown (e.g. a machine's retired pre-Linux tailnet
 # ghost: same hardware, dead entry, not a real second machine)
 HIDE_NODES = {str(x).lower() for x in (_FLEET_CFG.get("hide_nodes") or [])}
+# This machine's pi launch line (provider/model are personal taste)
+LOCAL_PI_CMD = _FLEET_CFG.get("local_pi_cmd") or LOCAL_PI_CMD
 # how to resume each harness's last session (used inside tmux on tap)
 RESUME_CMD = {
     "pi": "pi --continue",
@@ -1574,8 +1576,8 @@ FLOW_PRESETS = {
               "spiral_spd": (0.12, 0.18), "inten": (0.26, 0.34),
               "smooth": 0.09, "current": 0.42},
     "classic": {"ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.06,
-                "spiral_spd": (0.12, 0.18), "inten": (0.12, 0.44),
-                "smooth": 0.09, "current": 0.15, "levels": 1.0},
+                "spiral_spd": (0.16, 0.24), "inten": (0.12, 0.44),
+                "smooth": 0.12, "current": 0.42, "levels": 1.0},
     "drift2": {"ramp": RAMP, "fsize": 11, "spiral_w": 0.0,
                "spiral_spd": (0.12, 0.18), "inten": (0.20, 0.26),
                "smooth": 0.07, "current": 0.30},

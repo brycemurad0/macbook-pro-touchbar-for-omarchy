@@ -42,9 +42,13 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     LLMContextAssistantTurnFrame,
     LLMRunFrame,
+    LLMTextFrame,
     OutputAudioRawFrame,
     StartFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed
 from pipecat.pipeline.llm_switcher import LLMSwitcher
@@ -121,9 +125,53 @@ class PwInputTransport(BaseInputTransport):
 
     async def cleanup(self):
         await super().cleanup()
+        if self._task:
+            self._task.cancel()
+            self._task = None
         if self._proc:
-            self._proc.terminate()
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
             self._proc = None
+
+
+class FillerGate(FrameProcessor):
+    """If the brain hasn't started within ~1.6 s of the owner
+    finishing a real utterance, say one short line so silence never
+    reads as broken. Arms only after actual user speech (a stray
+    stop frame after the greeting must not trigger it)."""
+
+    def __init__(self):
+        super().__init__()
+        self._timer = None
+        self._user_spoke = False
+
+    def _disarm(self):
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self._user_spoke = True
+        elif isinstance(frame, UserStoppedSpeakingFrame) \
+                and self._user_spoke:
+            self._user_spoke = False
+            self._disarm()
+
+            async def fire():
+                await asyncio.sleep(1.6)
+                print("filler: One sec.", flush=True)
+                await self.push_frame(TTSSpeakFrame(text="One sec."),
+                                      FrameDirection.DOWNSTREAM)
+
+            self._timer = self.create_task(fire())
+        elif isinstance(frame, (LLMTextFrame, BotStartedSpeakingFrame)):
+            self._user_spoke = False
+            self._disarm()
+        await self.push_frame(frame, direction)
 
 
 class PwOutputTransport(BaseOutputTransport):
@@ -361,13 +409,14 @@ async def amain():
                 min_volume=0.55)),
             user_turn_stop_timeout=1.2))
     metrics = vt.ConvMetrics()
-    health = {"awaiting": True, "retries": 0,
-              "reask_pending": False}  # greeting is owed
+    health = {"awaiting": False, "retries": 0,
+              "reask_pending": False}  # greeting is local TTS now
     observer = StateObserver(metrics, health)
     pipeline = Pipeline([
         transport.input(), stt, HeardObserver(metrics, health),
         aggregators.user(),
-        llm, tts, transport.output(), aggregators.assistant(), observer])
+        llm, FillerGate(), tts, transport.output(),
+        aggregators.assistant(), observer])
     worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
     runner = WorkerRunner(handle_sigint=False)
 
@@ -387,6 +436,12 @@ async def amain():
             health["reask_pending"] = False
             if not health["awaiting"]:
                 return
+            if health["retries"] == 2:
+                # say it once, honestly, instead of filling forever
+                await worker.queue_frames([TTSSpeakFrame(
+                    text="Quick heads-up: my brain is unreachable "
+                         "right now. That is Google's quota, not your "
+                         "mic. I will keep trying.")])
             for svc in brain_members:
                 await svc.set_usable(True)
             await worker.queue_frames([LLMRunFrame()])
@@ -419,14 +474,17 @@ async def amain():
 
     await runner.add_workers(worker)
     vt.set_state(True, "listening")
-    context.add_message({
-        "role": "user",
-        "content": "[The owner just toggled voice on. Open with your "
-                   "greeting line, short and in character.]"})
+    # the greeting is spoken locally (ElevenLabs TTS only) so it can
+    # never be held hostage by brain quota; the model just finds it
+    # already said when the conversation starts
+    context.add_message({"role": "assistant",
+                         "content": cfg["first_message"]})
 
     async def greet():
         await asyncio.sleep(3)  # let the pipeline reach steady state
-        await worker.queue_frames([LLMRunFrame()])
+        print(f"greeting (local tts): {cfg['first_message']}", flush=True)
+        await worker.queue_frames(
+            [TTSSpeakFrame(text=cfg["first_message"])])
 
     asyncio.create_task(greet())
     print("pipecat voice up: Silero + Moonshine + Gemini + ElevenLabs",
