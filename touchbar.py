@@ -1576,7 +1576,7 @@ FLOW_PRESETS = {
               "spiral_spd": (0.12, 0.18), "inten": (0.26, 0.34),
               "smooth": 0.09, "current": 0.42},
     "classic": {"ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.06,
-                "spiral_spd": (0.16, 0.24), "inten": (0.12, 0.44),
+                "spiral_spd": (0.16, 0.24), "inten": (-0.06, 0.52),
                 "smooth": 0.12, "current": 0.42, "levels": 1.0},
     "drift2": {"ramp": RAMP, "fsize": 11, "spiral_w": 0.0,
                "spiral_spd": (0.12, 0.18), "inten": (0.20, 0.26),
@@ -1901,6 +1901,11 @@ class Renderer:
                 if touch_on:  # the water answers the finger
                     height += self._touch_wave(x + cw / 2, y, t)
                 _ia, _ib = self.style["inten"]
+                # dead space by default: only wave crests clear the
+                # skip threshold when energy is low. As agent work
+                # across the fleet raises energy, the base and swing
+                # grow, so waves fill in with denser glyphs instead
+                # of the whole strip lighting up.
                 inten = clamp(_ia + lvl * 0.24 * e
                               + (_ib + lvl * 0.36 * e) * height) ** 1.1
                 # temporal smoothing: cells ease toward their target instead
@@ -1914,7 +1919,7 @@ class Renderer:
                     else (0.30 if touch_on else self.style.get("smooth", 0.14))
                 inten = prev + (inten - prev) * factor
                 self._smooth[key] = inten
-                if inten < 0.03:
+                if inten < 0.08:
                     continue
                 gi = min(int(inten * len(self.style["ramp"])), len(self.style["ramp"]) - 1)
                 ci = min(int(inten * (FLOW_COLORS - 1)), FLOW_COLORS - 1)
