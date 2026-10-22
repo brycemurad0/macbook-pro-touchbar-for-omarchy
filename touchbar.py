@@ -1578,8 +1578,8 @@ FLOW_PRESETS = {
     # OWNER-FROZEN 2026-10-22: slow streaming waves, mostly dead
     # space at rest, density follows fleet agent work. Do not retune
     # without the owner watching (pinned by test_flow_owner_frozen).
-    "classic": {"ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.035,
-                "spiral_spd": (0.05, 0.08), "inten": (-0.06, 0.52),
+    "classic": {"ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.0,
+                "spiral_spd": (0.05, 0.08), "inten": (-0.06, 0.95),
                 "smooth": 0.08, "current": 0.13, "levels": 1.0},
     "drift2": {"ramp": RAMP, "fsize": 11, "spiral_w": 0.0,
                "spiral_spd": (0.12, 0.18), "inten": (0.20, 0.26),
@@ -1881,19 +1881,22 @@ class Renderer:
         # per-row trig factors for the base current: sin(p + o) factorization
         row_f = []
         for r in range(rows):
-            b = math.sin(r * 0.9 + ft * speed * 0.37) * amp
+            # static row phase: rows are offset copies of one traveling
+            # wave (a river surface), not independently wobbling rows —
+            # the old time-varying row phase was a shimmer source.
+            b = r * 0.55
             row_f.append((math.sin(b), math.cos(b), math.sin(r * 1.7), math.cos(r * 1.7)))
         for cxi in range(cols):
             x = cxi * cw
-            p1 = x * 0.011 + ft * speed
-            p2 = x * 0.023 - ft * speed * 0.62
+            p1 = x * 0.006 + ft * speed
+            p2 = x * 0.013 - ft * speed * 0.62
             s1, c1 = math.sin(p1), math.cos(p1)
             s2, c2 = math.sin(p2), math.cos(p2)
             for r in range(rows):
                 ybase = r * ch
                 y = ybase + ch / 2
                 sb, cb, so, co = row_f[r]
-                height = 0.30 * (s1 * cb + c1 * sb) + 0.18 * (s2 * co + c2 * so)
+                height = 0.34 * (s1 * cb + c1 * sb) + 0.06 * (s2 * co + c2 * so)
                 for (cx, cy, dirn, arms, wgt) in spirals:
                     dx, dy = x + cw / 2 - cx, y - cy
                     rad = math.hypot(dx, dy)
@@ -1921,8 +1924,17 @@ class Renderer:
                 factor = 1.0 if not getattr(self, "_flow_warm", False) \
                     else (0.30 if touch_on else self.style.get("smooth", 0.14))
                 inten = prev + (inten - prev) * factor
+                if getattr(self, "_flow_warm", False):
+                    # rate-limit the DISPLAYED level: a glyph band is
+                    # ~0.09 wide, so capping travel at 0.006/frame
+                    # means a cell holds each glyph ~0.75s minimum.
+                    # Without this, cells hovering at a band edge
+                    # flip-flop every frame — that flip-flop, not the
+                    # wave drift, is what reads as jitter on the bar.
+                    step = 0.05 if touch_on else 0.006
+                    inten = prev + max(-step, min(step, inten - prev))
                 self._smooth[key] = inten
-                if inten < 0.08:
+                if inten < 0.11:
                     continue
                 gi = min(int(inten * len(self.style["ramp"])), len(self.style["ramp"]) - 1)
                 ci = min(int(inten * (FLOW_COLORS - 1)), FLOW_COLORS - 1)

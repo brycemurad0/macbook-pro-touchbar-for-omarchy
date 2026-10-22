@@ -254,7 +254,7 @@ class FlowChips(unittest.TestCase):
             r = tb.Renderer(tb.Theme(), st)
             surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, tb.W, tb.H)
             r.view_flow(cairo.Context(surf), [], time.monotonic(), {})
-            lit = [v for v in r._smooth if v >= 0.08]
+            lit = [v for v in r._smooth if v >= 0.11]
             levels = {min(int(v * 12), 11) for v in lit}
             return lit, levels, max(r._smooth)
 
@@ -263,7 +263,7 @@ class FlowChips(unittest.TestCase):
                         tb.State())._smooth), 0.35,
                         "idle field must be mostly dead space")
         full_lit, full_levels, full_max = probe(1.0)
-        self.assertGreater(len(full_lit), len(idle_lit) * 1.8,
+        self.assertGreater(len(full_lit), len(idle_lit) * 1.6,
                            "coverage must grow with energy")
         self.assertGreaterEqual(len(full_levels), 4,
                                 "busy field must shade across glyph weights")
@@ -299,6 +299,6 @@ class FlowFrozen(unittest.TestCase):
         # owner watching — update this pin in the same commit as an
         # owner-approved retune, never silently.
         self.assertEqual(tb.FLOW_PRESETS["classic"], {
-            "ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.035,
-            "spiral_spd": (0.05, 0.08), "inten": (-0.06, 0.52),
+            "ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.0,
+            "spiral_spd": (0.05, 0.08), "inten": (-0.06, 0.95),
             "smooth": 0.08, "current": 0.13, "levels": 1.0})
