@@ -935,3 +935,197 @@ if __name__ == "__main__":
     main()
 
 
+
+
+# ------------------------------------------------------- OS + sessions
+# Added from the live voice tour (2026-10-22): she could answer
+# questions but couldn't DO basic OS things — launch an app that
+# isn't open, read a session without improvising ssh, or drive a
+# session. These close that gap.
+
+import glob as _glob
+import re as _re
+import shlex as _shlex
+
+
+def _safe_session(name):
+    name = _re.sub(r"[^A-Za-z0-9_.-]", "-", (name or "").strip())
+    return name[:60]
+
+
+def tool_open_app(query):
+    q = (query or "").strip().lower()
+    if not q:
+        return "no app named"
+    for pat in ("/usr/share/applications/*.desktop",
+                os.path.expanduser("~/.local/share/applications/*.desktop"),
+                "/var/lib/flatpak/exports/share/applications/*.desktop",
+                os.path.expanduser(
+                    "~/.local/share/flatpak/exports/share/applications/"
+                    "*.desktop")):
+        for path in _glob.glob(pat):
+            try:
+                head = open(path, errors="replace").read(4096)
+            except OSError:
+                continue
+            m = _re.search(r"^Name=(.+)$", head, _re.M)
+            if m and q in m.group(1).lower():
+                app_id = os.path.basename(path)[:-len(".desktop")]
+                subprocess.Popen(["gtk-launch", app_id],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                return f"opened {m.group(1)}"
+    exe = _shlex.quote(query.strip())
+    out = subprocess.run(["bash", "-lc", f"command -v {exe}"],
+                         capture_output=True, text=True, timeout=5)
+    if out.stdout.strip():
+        subprocess.Popen([query.strip()], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return f"opened {query.strip()}"
+    return f"no app matching '{query}'"
+
+
+def tool_close_window(query):
+    try:
+        clients = json.loads(_hypr("j/clients"))
+    except Exception:
+        return "could not read the window list"
+    q = (query or "").lower()
+    for c in clients:
+        if q in (c.get("class", "") + " " + c.get("title", "")).lower():
+            pid = c.get("pid")
+            if pid:
+                subprocess.run(["kill", str(pid)], capture_output=True,
+                               timeout=5)
+                return f"closed {c.get('class')}"
+            return "found it but could not close it"
+    return f"no window matching '{query}'"
+
+
+def tool_read_session(node_query, session, lines=30):
+    node = _resolve_node(node_query)
+    if node == "unknown":
+        return f"no fleet node matching '{node_query}'"
+    name = _safe_session(session)
+    if not name:
+        return "no session named"
+    try:
+        n = max(5, min(int(lines or 30), 120))
+    except (TypeError, ValueError):
+        n = 30
+    cmd = (f"tmux capture-pane -pt {_shlex.quote(name)} -S -{n} "
+           "2>/dev/null | grep -v '^$' | tail -n 25")
+    try:
+        out = _run_on(node, cmd, timeout=12)
+    except Exception as exc:
+        return f"could not read session: {exc}"
+    return _truncate(out or "session is empty or not found", 1500)
+
+
+def tool_send_to_session(node_query, session, text):
+    node = _resolve_node(node_query)
+    if node == "unknown":
+        return f"no fleet node matching '{node_query}'"
+    name = _safe_session(session)
+    if not name or not (text or "").strip():
+        return "need a session and text"
+    cmd = (f"tmux send-keys -t {_shlex.quote(name)} -l -- "
+           f"{_shlex.quote(text)} && tmux send-keys -t "
+           f"{_shlex.quote(name)} Enter")
+    try:
+        _run_on(node, cmd, timeout=12)
+    except Exception as exc:
+        return f"could not send to session: {exc}"
+    where = "here" if node is None else node["display"]
+    return f"sent to {name} on {where}"
+
+
+_INTERACTIVE_HARNESS = {"pi": "pi", "claude": "claude", "codex": "codex",
+                        "grok": "grok", "opencode": "opencode"}
+
+
+def tool_start_session(node_query, harness, goal=""):
+    node = _resolve_node(node_query)
+    if node == "unknown":
+        return f"no fleet node matching '{node_query}'"
+    exe = _INTERACTIVE_HARNESS.get((harness or "pi").lower(), "pi")
+    name = _safe_session(f"tb-{exe}-{int(time.time()) % 100000}")
+    cmd = (f"tmux new-session -d -s {_shlex.quote(name)} "
+           f"{_shlex.quote(exe)}")
+    try:
+        _run_on(node, cmd, timeout=15)
+        if (goal or "").strip():
+            time.sleep(3)
+            _run_on(node,
+                    f"tmux send-keys -t {_shlex.quote(name)} -l -- "
+                    f"{_shlex.quote(goal)} && tmux send-keys -t "
+                    f"{_shlex.quote(name)} Enter", timeout=12)
+    except Exception as exc:
+        return f"could not start session: {exc}"
+    where = "here" if node is None else node["display"]
+    return (f"session {name} started on {where} running {exe}"
+            " — it shows on the LIVE bar")
+
+
+def tool_stop_session(node_query, session):
+    node = _resolve_node(node_query)
+    if node == "unknown":
+        return f"no fleet node matching '{node_query}'"
+    name = _safe_session(session)
+    if not name:
+        return "no session named"
+    try:
+        _run_on(node, f"tmux kill-session -t {_shlex.quote(name)}",
+                timeout=12)
+    except Exception as exc:
+        return f"could not stop session: {exc}"
+    return f"session {name} stopped"
+
+
+def tool_system_control(action, value=None):
+    a = (action or "").lower()
+    try:
+        if a == "volume":
+            v = max(0, min(int(value), 100))
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@",
+                            f"{v / 100:.2f}"], capture_output=True, timeout=5)
+            return f"volume {v} percent"
+        if a in ("volume_up", "volume_down"):
+            d = "5%+" if a == "volume_up" else "5%-"
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", d],
+                           capture_output=True, timeout=5)
+            return a.replace("_", " ")
+        if a == "mute":
+            subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@",
+                            "toggle"], capture_output=True, timeout=5)
+            return "mute toggled"
+        if a == "brightness":
+            v = max(5, min(int(value), 100))
+            subprocess.run(["brightnessctl", "set", f"{v}%"],
+                           capture_output=True, timeout=5)
+            return f"brightness {v} percent"
+        if a == "lock":
+            subprocess.Popen(["hyprlock"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return "screen locked"
+    except (TypeError, ValueError):
+        return f"'{action}' needs a numeric value"
+    except Exception as exc:
+        return f"system control failed: {exc}"
+    return f"unknown system action '{action}'"
+
+
+TOOL_FUNCS.update({
+    "open_app": lambda a: tool_open_app(a.get("app", "")),
+    "close_window": lambda a: tool_close_window(a.get("query", "")),
+    "read_session": lambda a: tool_read_session(
+        a.get("node", "here"), a.get("session", ""), a.get("lines", 30)),
+    "send_to_session": lambda a: tool_send_to_session(
+        a.get("node", "here"), a.get("session", ""), a.get("text", "")),
+    "start_session": lambda a: tool_start_session(
+        a.get("node", "here"), a.get("harness", "pi"), a.get("goal", "")),
+    "stop_session": lambda a: tool_stop_session(
+        a.get("node", "here"), a.get("session", "")),
+    "system_control": lambda a: tool_system_control(
+        a.get("action", ""), a.get("value")),
+})

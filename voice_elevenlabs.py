@@ -24,7 +24,7 @@ def ensure_agent(key, cfg):
     prompt = (cfg["prompt"]
               .replace("{{node}}", os.uname().nodename)
               .replace("{{time}}", _dt.datetime.now().strftime("%A %H:%M"))
-              .replace("{{fleet}}", vt.tool_fleet_status())
+              .replace("{{fleet}}", "Fleet state is NOT preloaded: call fleet_status / fleet_sessions / node_status for live state, every time.")
               .replace("{{brain}}", "ElevenLabs' hosted voice agent"))
     body = {"name": "Omarchy Voice",
             "conversation_config": {

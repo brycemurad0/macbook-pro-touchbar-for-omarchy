@@ -127,7 +127,10 @@ class VoiceConfigTests(unittest.TestCase):
                                  "work_status", "fleet_sessions",
                                  "node_status", "node_shell", "daily_brief",
                                  "brain_search", "memory_search", "remember",
-                                 "clipboard", "notify", "remind", "media"])
+                                 "clipboard", "notify", "remind", "media",
+                                 "open_app", "close_window", "read_session",
+                                 "send_to_session", "start_session",
+                                 "stop_session", "system_control"])
         self.assertEqual(set(names), set(vt.TOOL_FUNCS))
 
     def test_tool_schemas_are_gemini_shaped(self):
@@ -287,3 +290,37 @@ class EchoGuardTests(unittest.TestCase):
     def test_short_and_empty_never_echo(self):
         self.assertFalse(vt.is_echo("Okay.", "Okay. Got it."))
         self.assertFalse(vt.is_echo("anything at all", ""))
+
+
+class OsToolTests(unittest.TestCase):
+    def test_safe_session_sanitizes(self):
+        self.assertEqual(vt._safe_session("tb-foo; rm -rf /"), "tb-foo--rm--rf--")
+        self.assertEqual(vt._safe_session(""), "")
+
+    def test_system_control_validation(self):
+        self.assertIn("unknown system action", vt.tool_system_control("bogus"))
+        self.assertIn("needs a numeric value",
+                      vt.tool_system_control("volume", "loud"))
+
+    def test_session_lifecycle_local(self):
+        # real tmux round-trip on this machine, own throwaway session
+        subprocess.run(["tmux", "kill-session", "-t", "vt-test"],
+                       capture_output=True)
+        out = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", "vt-test", "bash"],
+            capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0)
+        try:
+            sent = vt.tool_send_to_session("here", "vt-test",
+                                           "echo voice-tool-ok")
+            self.assertIn("sent to vt-test", sent)
+            time.sleep(0.5)
+            read = vt.tool_read_session("here", "vt-test")
+            self.assertIn("voice-tool-ok", read)
+        finally:
+            stopped = vt.tool_stop_session("here", "vt-test")
+        self.assertIn("stopped", stopped)
+
+    def test_open_app_no_match(self):
+        self.assertIn("no app matching",
+                      vt.tool_open_app("definitely-not-an-app-xyz"))

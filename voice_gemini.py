@@ -26,7 +26,7 @@ async def main():
     system = (cfg["prompt"]
               .replace("{{node}}", os.uname().nodename)
               .replace("{{time}}", datetime.datetime.now().strftime("%A %H:%M"))
-              .replace("{{fleet}}", vt.tool_fleet_status())
+              .replace("{{fleet}}", "Fleet state is NOT preloaded: call fleet_status / fleet_sessions / node_status for live state, every time.")
               .replace("{{brain}}", "Google's Gemini Live voice model"))
     tools = [types.Tool(function_declarations=[
         types.FunctionDeclaration(

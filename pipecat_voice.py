@@ -477,7 +477,7 @@ async def amain():
               .replace("{{node}}", os.uname().nodename)
               .replace("{{time}}", datetime.datetime.now().strftime(
                   "%A %H:%M"))
-              .replace("{{fleet}}", vt.tool_fleet_status())
+              .replace("{{fleet}}", "Fleet state is NOT preloaded: call fleet_status / fleet_sessions / node_status for live state, every time.")
               .replace("{{brain}}", "the configured voice brain "
                        f"({(cfg.get('brain_models') or ['local'])[0]})"))
     transport = PwTransport(TransportParams(
