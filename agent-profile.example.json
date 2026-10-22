@@ -4,7 +4,7 @@
   "llm_note": "Owner-chosen brain: gemini-3.8-flash (ElevenLabs-hosted). apply_agent.py falls back 3.7 -> 3.5 -> 2.5 only if the account rejects it. NOTE: never PATCH a round-tripped GET agent config - it carries both tools and tool_ids and ElevenLabs rejects that; always apply from this profile.",
   "temperature": 0.7,
   "tts_model": "eleven_flash_v2",
-  "voice_name": "Alice",
+  "voice_name": "Sarah",
   "voice_settings": {
     "stability": 0.45,
     "similarity_boost": 0.8,
@@ -307,8 +307,11 @@
     }
   ],
   "conversation": {
-    "turn_timeout": 12,
-    "silence_end_call_timeout": -1,
     "max_duration_seconds": 3600
+  },
+  "turn": {
+    "turn_eagerness": "patient",
+    "turn_timeout": 12,
+    "silence_end_call_timeout": -1
   }
 }

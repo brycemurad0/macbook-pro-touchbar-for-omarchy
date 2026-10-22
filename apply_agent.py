@@ -87,6 +87,7 @@ def main():
                         "agent_output_audio_format":
                             profile["audio"]["output_format"],
                         "voice_settings": profile["voice_settings"]},
+                "turn": profile.get("turn", {}),
                 "conversation": profile["conversation"]}}
         try:
             if agent_id:
