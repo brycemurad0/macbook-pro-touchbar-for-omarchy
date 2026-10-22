@@ -71,23 +71,23 @@ class TwoTap(unittest.TestCase):
 class ReapClosed(unittest.TestCase):
     def test_closed_owned_terminal_kills_exact_session(self):
         d = make_daemon()
-        d.st._remote_agents = [{"kind": "pi", "node": "bob", "node_name": "Bob",
+        d.st._remote_agents = [{"kind": "pi", "node": "node-b", "node_name": "Node B",
                                 "detail": "pi - Bob", "elapsed": 60, "active": False,
                                 "percent": None, "pid": 0, "remote": True,
                                 "window": None, "tmux": "work-session"}]
         # dead pid -> viewer closed; ownership/session from runtime record
-        d.act._launched[("bob", "work-session")] = {
+        d.act._launched[("node-b", "work-session")] = {
             "pid": 424242, "owned": True, "session": "work-session"}
         CALLS.clear()
         d.act.reap_closed()
-        self.assertNotIn(("bob", "work-session"), d.act._launched)
+        self.assertNotIn(("node-b", "work-session"), d.act._launched)
         self.assertTrue(any("kill-session" in " ".join(c) and "work-session" in " ".join(c)
                             for c in CALLS if c[0] == "ssh"), f"expected ssh tmux kill, got {CALLS}")
         self.assertEqual(d.st._remote_agents, [], "card source must be removed at once")
 
     def test_closed_existing_session_is_never_killed(self):
         d = make_daemon()
-        d.act._launched[("bob", "work-session")] = {
+        d.act._launched[("node-b", "work-session")] = {
             "pid": 424242, "owned": False, "session": "work-session"}
         CALLS.clear()
         d.act.reap_closed()
@@ -113,11 +113,11 @@ class DevOffline(unittest.TestCase):
         d = make_daemon()
         d.st.nodes_detail = [{"name": "Atlas", "host": "atlas", "ssh": "atlas",
                               "online": False, "os": "macOS", "ip": ""},
-                             {"name": "Bob", "host": "bob", "ssh": "bob",
+                             {"name": "Node B", "host": "node-b", "ssh": "node-b",
                               "online": True, "os": "linux", "ip": ""}]
         hits = render(d, "dev")
         datas = [h[5].get("name") for h in hits if h[4] == "node"]
-        self.assertIn("Bob", datas)
+        self.assertIn("Node B", datas)
         self.assertNotIn("Atlas", datas, "offline node must not be a launch target")
 
 class GhostNode(unittest.TestCase):
@@ -126,11 +126,11 @@ class GhostNode(unittest.TestCase):
         # pre-Linux macOS node) must not show up as a dead machine
         import json as _json
         d = make_daemon()
-        payload = {"Self": {"HostName": "fred",
+        payload = {"Self": {"HostName": "thismac",
                             "TailscaleIPs": ["100.64.0.1"]},
                    "Peer": {
-                       "a": {"HostName": "Fred's MacBook Pro",
-                             "DNSName": "freds-macbook-pro.tail.example.",
+                       "a": {"HostName": "Old MacBook Pro",
+                             "DNSName": "old-macbook-pro.tail.example.",
                              "OS": "macOS", "Online": False,
                              "TailscaleIPs": ["100.64.0.9"]},
                        "b": {"HostName": "bob",
@@ -143,13 +143,13 @@ class GhostNode(unittest.TestCase):
 
         orig_run, orig_hide = tb.subprocess.run, tb.HIDE_NODES
         tb.subprocess.run = lambda *a, **k: R()
-        tb.HIDE_NODES = {"freds-macbook-pro"}
+        tb.HIDE_NODES = {"old-macbook-pro"}
         try:
             d.st._scan_fleet()
         finally:
             tb.subprocess.run, tb.HIDE_NODES = orig_run, orig_hide
         names = [e["name"].lower() for e in d.st.nodes_detail]
-        self.assertNotIn("fred's macbook pro", names)
+        self.assertNotIn("old macbook pro", names)
         self.assertIn("bob", names)
 
 
@@ -241,10 +241,11 @@ class FlowChips(unittest.TestCase):
         self.assertLess(max(diffs), 0.05)
 
     def test_flow_weightings_vary_and_scale(self):
-        # the owner-approved field: smooth gradations across the glyph
-        # ramp (not a binary on/off field), and weighting that scales
-        # with energy. This pins the approved look; retune only with
-        # the owner watching.
+        # the owner-approved field (retuned 2026-10-22 at the owner's
+        # direction): mostly dead space at rest — only wave crests
+        # render — and as energy (fleet agent work) rises the waves
+        # fill in across the glyph ramp. Retune only with the owner
+        # watching.
         import cairo
 
         def probe(energy):
@@ -253,13 +254,19 @@ class FlowChips(unittest.TestCase):
             r = tb.Renderer(tb.Theme(), st)
             surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, tb.W, tb.H)
             r.view_flow(cairo.Context(surf), [], time.monotonic(), {})
-            levels = {min(int(v * 12), 11) for v in r._smooth if v >= 0.03}
-            return levels, max(r._smooth)
+            lit = [v for v in r._smooth if v >= 0.08]
+            levels = {min(int(v * 12), 11) for v in lit}
+            return lit, levels, max(r._smooth)
 
-        levels, idle_max = probe(0.0)
-        self.assertGreaterEqual(len(levels), 4,
-                                "field must shade across glyph weights")
-        _, full_max = probe(1.0)
+        idle_lit, _, idle_max = probe(0.0)
+        self.assertLess(len(idle_lit) / len(tb.Renderer(tb.Theme(),
+                        tb.State())._smooth), 0.35,
+                        "idle field must be mostly dead space")
+        full_lit, full_levels, full_max = probe(1.0)
+        self.assertGreater(len(full_lit), len(idle_lit) * 1.8,
+                           "coverage must grow with energy")
+        self.assertGreaterEqual(len(full_levels), 4,
+                                "busy field must shade across glyph weights")
         self.assertGreater(full_max, idle_max * 1.8)
 
 
