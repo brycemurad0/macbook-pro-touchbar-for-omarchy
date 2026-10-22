@@ -1,7 +1,7 @@
 {
   "name": "Omarchy Voice",
-  "llm": "gemini-2.5-flash",
-  "llm_note": "Latest Gemini Flash available on ElevenLabs at apply time; apply_agent.py falls back to the newest gemini-*-flash the account offers. Voice-layer only: conversation + tool decisions. Real work runs on stronger harness models.",
+  "llm": "gemini-3.8-flash",
+  "llm_note": "Owner-chosen brain: gemini-3.8-flash (ElevenLabs-hosted). apply_agent.py falls back 3.7 -> 3.5 -> 2.5 only if the account rejects it. NOTE: never PATCH a round-tripped GET agent config - it carries both tools and tool_ids and ElevenLabs rejects that; always apply from this profile.",
   "temperature": 0.7,
   "tts_model": "eleven_flash_v2",
   "voice_name": "Jessica",

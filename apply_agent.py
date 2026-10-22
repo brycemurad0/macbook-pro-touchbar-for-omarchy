@@ -52,9 +52,10 @@ def main():
         raise SystemExit("no ELEVENLABS_API_KEY (env or voice-secrets.env)")
     profile = json.load(open(PROFILE))
     voices = call(key, "GET", "/voices").get("voices", [])
+    target = profile["voice_name"].lower()
     voice = next((v for v in voices
-                  if v.get("name", "").lower()
-                  == profile["voice_name"].lower()), None) \
+                  if v.get("name", "").split(" - ")[0].strip().lower()
+                  == target), None) \
         or (voices[0] if voices else None)
     if not voice:
         raise SystemExit("no voices on this ElevenLabs account")
@@ -64,8 +65,9 @@ def main():
               "parameters": t["parameters"], "expects_response": True}
              for t in profile["tools"]]
     cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
-    llm_candidates = [profile["llm"], "gemini-2.5-flash",
-                      "gemini-2.0-flash", "gpt-4.1-mini"]
+    llm_candidates = [profile["llm"], "gemini-3.8-flash",
+                      "gemini-3.7-flash", "gemini-3.5-flash",
+                      "gemini-2.5-flash", "gpt-4.1-mini"]
     agent_id = cfg.get("agent_id")
     last_err = None
     for llm in dict.fromkeys(llm_candidates):
