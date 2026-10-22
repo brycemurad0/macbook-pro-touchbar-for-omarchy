@@ -218,7 +218,8 @@ class RetryObserver(BaseObserver):
         if isinstance(data.frame, ErrorFrame) and self.health["awaiting"]:
             text = str(data.frame.error)
             if any(k in text for k in ("429", "RESOURCE_EXHAUSTED",
-                                       "503", "UNAVAILABLE")):
+                                       "503", "UNAVAILABLE", "TIMEOUT",
+                                       "DEADLINE")):
                 self.kick()
 
 
@@ -296,7 +297,8 @@ class BrainLLM(GoogleLLMService):
                          category=None, force_treat_as_permanent=False):
         text = f"{error_msg} {exception}"
         if any(k in text for k in ("429", "RESOURCE_EXHAUSTED", "503",
-                                   "UNAVAILABLE")):
+                                   "UNAVAILABLE", "TIMEOUT",
+                                   "DEADLINE")):
             force_treat_as_permanent = True
         await super().push_error(
             error_msg, exception=exception, fatal=fatal, category=category,
