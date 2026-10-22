@@ -95,9 +95,18 @@ class VoiceConfigTests(unittest.TestCase):
         cls.cfg = _load_voice_config()
 
     def test_single_config_shape(self):
-        self.assertTrue(self.cfg["brain_models"])
-        self.assertTrue(all("flash" in m
+        self.assertGreaterEqual(len(self.cfg["brain_models"]), 2)
+        self.assertTrue(all(isinstance(m, str) and m
                             for m in self.cfg["brain_models"]))
+
+    def test_brain_chain_entries_parse(self):
+        # 'provider:model', bare = google; providers the daemon knows
+        known = {"google", "anthropic", "openai", "openrouter"}
+        for spec in self.cfg["brain_models"]:
+            provider, _, model = spec.partition(":")
+            if model:
+                self.assertIn(provider, known, spec)
+            self.assertTrue(model or provider)
         self.assertTrue(self.cfg["tts"]["voice_id"])
         self.assertTrue(self.cfg["tts"]["model"])
         self.assertTrue(self.cfg["first_message"].strip())
@@ -161,12 +170,12 @@ class VoiceConfigTests(unittest.TestCase):
         self.assertGreater(len(seen["auth"]), 12)
 
     def test_hidden_ghost_node_skipped(self):
-        payload = {"Self": {"HostName": "fred",
+        payload = {"Self": {"HostName": "thismac",
                             "DNSName": "fred.tail.example.",
                             "OS": "linux", "Online": True},
                    "Peer": {
-                       "a": {"HostName": "Fred's MacBook Pro",
-                             "DNSName": "freds-macbook-pro.tail.example.",
+                       "a": {"HostName": "Old MacBook Pro",
+                             "DNSName": "old-macbook-pro.tail.example.",
                              "OS": "macOS", "Online": False},
                        "b": {"HostName": "bob",
                              "DNSName": "bob.tail.example.",
@@ -177,12 +186,12 @@ class VoiceConfigTests(unittest.TestCase):
 
         orig_run, orig_cfg = vt.subprocess.run, vt._fleet_cfg
         vt.subprocess.run = lambda *a, **k: R()
-        vt._fleet_cfg = lambda: {"hide_nodes": ["freds-macbook-pro"]}
+        vt._fleet_cfg = lambda: {"hide_nodes": ["old-macbook-pro"]}
         try:
             labels = [n["label"] for n in vt._fleet_nodes()]
         finally:
             vt.subprocess.run, vt._fleet_cfg = orig_run, orig_cfg
-        self.assertNotIn("freds-macbook-pro", labels)
+        self.assertNotIn("old-macbook-pro", labels)
         self.assertIn("bob", labels)
 
     def test_node_resolution(self):

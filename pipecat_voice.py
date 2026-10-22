@@ -61,9 +61,11 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.moonshine.stt import MoonshineSTTService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -336,38 +338,91 @@ def register_tools(llm):
 
 
 # -------------------------------------------------------------------- main
-class BrainLLM(GoogleLLMService):
-    """Marks itself unusable on quota/capacity errors so the failover
-    switcher moves on; a bare 429 would otherwise read as a hiccup the
-    service 'can carry on from' and the turn dies silently."""
+class _BenchOnError:
+    """Marks the model unusable on quota/capacity/timeout failures so
+    the failover switcher moves the conversation on; a bare 429 would
+    otherwise read as a hiccup the service 'can carry on from' and
+    the turn dies silently. Provider-agnostic."""
 
     async def push_error(self, error_msg, exception=None, fatal=False,
                          category=None, force_treat_as_permanent=False):
         text = f"{error_msg} {exception}"
         if any(k in text for k in ("429", "RESOURCE_EXHAUSTED", "503",
-                                   "UNAVAILABLE", "TIMEOUT",
-                                   "DEADLINE")):
+                                   "UNAVAILABLE", "TIMEOUT", "DEADLINE",
+                                   "RATE_LIMIT", "OVERLOADED")):
             force_treat_as_permanent = True
         await super().push_error(
             error_msg, exception=exception, fatal=fatal, category=category,
             force_treat_as_permanent=force_treat_as_permanent)
 
 
-def build_brain(gkey, cfg, system):
-    """Gemini free-tier quotas are per-model per-day and tiny (3.8:
-    20/day), so a single model silently dies mid-evening. voice.json's
-    brain_models list is a failover chain: a 429/503 moves the
-    conversation to the next model instead of going mute."""
-    models = list(dict.fromkeys(
-        m for m in (cfg.get("brain_models") or []) if m))
-    llms = []
-    for model in models:
-        svc = BrainLLM(
-            api_key=gkey, model=model, system_instruction=system,
-            params=GoogleLLMService.InputParams(temperature=0.7))
+class BrainGoogleLLM(_BenchOnError, GoogleLLMService):
+    pass
+
+
+class BrainAnthropicLLM(_BenchOnError, AnthropicLLMService):
+    pass
+
+
+class BrainOpenAILLM(_BenchOnError, OpenAILLMService):
+    pass
+
+
+def _secret(name):
+    try:
+        for line in open(vt.SECRETS_ENV):
+            if line.startswith(name + "="):
+                return line.split("=", 1)[1].strip().strip('"') or None
+    except OSError:
+        pass
+    return os.environ.get(name)
+
+
+def build_brain(cfg, system):
+    """voice.json's brain_models is a failover chain. Entries are
+    'provider:model' (bare names = google). Any provider whose API
+    key is absent from voice-secrets.env is skipped, so dropping a
+    key in is all it takes to add a brain; a rate-limited or down
+    model benches itself and the conversation re-asks on the next."""
+    llms, names = [], []
+    for spec in cfg.get("brain_models") or []:
+        provider, _, model = str(spec).partition(":")
+        if not model:
+            provider, model = "google", provider
+        provider, model = provider.strip().lower(), model.strip()
+        svc = None
+        if provider == "google":
+            key = vt._gemini_key()
+            if key:
+                svc = BrainGoogleLLM(
+                    api_key=key, model=model,
+                    params=GoogleLLMService.InputParams(temperature=0.7))
+        elif provider == "anthropic":
+            key = _secret("ANTHROPIC_API_KEY")
+            if key:
+                svc = BrainAnthropicLLM(
+                    api_key=key, model=model,
+                    params=AnthropicLLMService.InputParams(temperature=0.7))
+        elif provider in ("openai", "openrouter"):
+            key = _secret("OPENAI_API_KEY" if provider == "openai"
+                          else "OPENROUTER_API_KEY")
+            if key:
+                kw = {"api_key": key, "model": model,
+                      "params": OpenAILLMService.InputParams(
+                          temperature=0.7)}
+                if provider == "openrouter":
+                    kw["base_url"] = "https://openrouter.ai/api/v1"
+                svc = BrainOpenAILLM(**kw)
+        if svc is None:
+            print(f"brain skip {spec}: no key / unknown provider",
+                  flush=True)
+            continue
         register_tools(svc)
         llms.append(svc)
-    print(f"brain chain: {' -> '.join(models)}", flush=True)
+        names.append(spec)
+    print(f"brain chain: {' -> '.join(names) or '(none)'}", flush=True)
+    if not llms:
+        return None, llms
     if len(llms) == 1:
         return llms[0], llms
     return LLMSwitcher(llms=llms,
@@ -376,11 +431,10 @@ def build_brain(gkey, cfg, system):
 
 async def amain():
     cfg = json.load(open(os.path.join(BASE, "voice.json")))
-    gkey = vt._gemini_key()
     el_key = vt.resolve_elevenlabs_key()
-    if not gkey or not el_key:
+    if not el_key:
         vt.set_state(True, "sign-in needed")
-        print("pipecat voice needs GEMINI_API_KEY and ELEVENLABS_API_KEY "
+        print("pipecat voice needs ELEVENLABS_API_KEY "
               "in voice-secrets.env", flush=True)
         while True:
             await asyncio.sleep(30)
@@ -394,13 +448,22 @@ async def amain():
         audio_in_enabled=True, audio_out_enabled=True,
         audio_in_sample_rate=RATE, audio_out_sample_rate=RATE))
     stt = MoonshineSTTService()
-    llm, brain_members = build_brain(gkey, cfg, system)
+    llm, brain_members = build_brain(cfg, system)
+    if llm is None:
+        vt.set_state(True, "no brain key")
+        print("no brain provider key found in voice-secrets.env "
+              "(GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / "
+              "OPENROUTER_API_KEY)", flush=True)
+        while True:
+            await asyncio.sleep(30)
     tts = ElevenLabsTTSService(
         api_key=el_key,
         voice_id=cfg["tts"]["voice_id"],
         settings=ElevenLabsTTSService.Settings(model=cfg["tts"]["model"]),
         sample_rate=RATE)
     context = LLMContext(tools=build_tools(cfg))
+    # persona rides in context so every provider gets it identically
+    context.add_message({"role": "system", "content": system})
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(

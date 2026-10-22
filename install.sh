@@ -24,7 +24,7 @@ if [ ! -x "$DEST/.venv/bin/python" ]; then
   python3 -m venv "$DEST/.venv"
   "$DEST/.venv/bin/pip" install -q --upgrade pip
   "$DEST/.venv/bin/pip" install -q \
-    'pipecat-ai[silero,moonshine,elevenlabs,google]'
+    'pipecat-ai[silero,moonshine,elevenlabs,google,openai,anthropic]'
 fi
 
 echo "==> uinput udev rule (key injection needs the input group device)"

@@ -57,15 +57,21 @@ in `voice-secrets.env` (mode 600, never committed):
 `ELEVENLABS_API_KEY` and `GEMINI_API_KEY`.
 
 The brain is a **failover chain** (`brain_models`, first = your
-pick): Gemini's free tier allows ~20 requests/day on the good Flash
-models, so a single model goes mute mid-evening. A 429/503 marks
-that model out and the conversation re-asks on the next; failed
-turns retry patiently in the background. Expect the greeting to
-take a few extra seconds when the primary is tapped out — and know
-that enabling billing on the Gemini project is what makes the
-primary model simply always answer. Every conversation appends one
-numeric metrics row (turns, words, agent characters, latency, tool
-calls) to `~/.local/state/omarchy-touchbar/voice-metrics.jsonl`.
+pick). Entries are `provider:model` — `google` (bare names work
+too), `anthropic`, `openai`, `openrouter` — and each provider joins
+only when its key exists in `voice-secrets.env`
+(`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`OPENROUTER_API_KEY`), so adding a brain later is a key drop, not a
+code change. This matters because metered free tiers are tiny
+(Gemini's good Flash models allow ~20 requests/day): a 429/503 or a
+stall benches that model and the conversation re-asks on the next,
+with patient background retries and one honest spoken status line
+instead of silence when the whole chain is down. The greeting is
+spoken locally and never waits on a brain. If a turn takes a
+moment, the agent says "One sec." rather than leaving dead air.
+Every conversation appends one numeric metrics row (turns, words,
+agent characters, latency, tool calls) to
+`~/.local/state/omarchy-touchbar/voice-metrics.jsonl`.
 
 Test hooks: `OMARCHY_VOICE_MIC` / `OMARCHY_VOICE_SPK` env vars
 override the `pw-record`/`pw-cat` PipeWire targets, so the whole
