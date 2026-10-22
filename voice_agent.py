@@ -1197,7 +1197,11 @@ class ElevenLabsSession:
 
     @property
     def speaking(self):
-        return time.time() - self._last_audio < 0.45
+        # audio keeps leaving the speakers ~1s after the last chunk
+        # arrives (pw-cat + convolver buffering); the mic must stay
+        # gated for that whole tail or the agent hears itself, ASR
+        # transcribes it as the user, and it converses with itself
+        return time.time() - self._last_audio < 1.15
 
     def _start_player(self):
         args = ["pw-cat", "--playback", "--raw", "--rate", str(self._out_rate),
@@ -1237,13 +1241,20 @@ class ElevenLabsSession:
                     if not raw:
                         print("mic stream ended; respawning capture", flush=True)
                         break
-                    # duck hard while the agent speaks: no echo canceller
-                    # on this path, full-level speaker echo would make it
-                    # interrupt itself; a loud real voice still gets in
-                    gain = 0.12 if self.speaking else 2.2
+                    # half-duplex while the agent speaks (+ tail): no
+                    # echo canceller on this path, and even ducked echo
+                    # was enough for ASR to transcribe the agent as the
+                    # user and start a self-conversation. Digital
+                    # silence until the speakers have truly finished;
+                    # the user barges in between sentences, not over them
+                    if self.speaking:
+                        raw = b"\x00" * len(raw)
+                        await self.ws.send(json.dumps({
+                            "user_audio_chunk": base64.b64encode(raw).decode()}))
+                        continue
                     await self.ws.send(json.dumps({
                         "user_audio_chunk":
-                        base64.b64encode(_gain_pcm(raw, gain)).decode()}))
+                        base64.b64encode(_gain_pcm(raw, 2.2)).decode()}))
             except Exception as exc:
                 print(f"mic loop interrupted: {exc}", flush=True)
             finally:

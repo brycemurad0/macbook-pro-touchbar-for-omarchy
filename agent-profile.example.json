@@ -4,7 +4,7 @@
   "llm_note": "Latest Gemini Flash available on ElevenLabs at apply time; apply_agent.py falls back to the newest gemini-*-flash the account offers. Voice-layer only: conversation + tool decisions. Real work runs on stronger harness models.",
   "temperature": 0.7,
   "tts_model": "eleven_flash_v2",
-  "voice_name": "Roger",
+  "voice_name": "Jessica",
   "voice_settings": {
     "stability": 0.45,
     "similarity_boost": 0.8,
