@@ -1,4 +1,4 @@
-# Handoff: omarchy-touchbar (M1 MacBook Pro Touch Bar)
+# Handoff: MacBook Pro Touch Bar for Omarchy
 
 Goal: a living Touch Bar for Omarchy — ASCII pinwheel flow behind every view, functional
 controls, tap-to-focus sessions (local + fleet), a DEV launcher (node × harness → tmux →
@@ -256,3 +256,20 @@ Acceptance passed end-to-end. Root causes found and fixed upstream:
   restart the voice service mid-conversation. ElevenLabs agent/bridge
   remain as fallbacks; Funnel exposure can be retired once Pipecat is
   owner-accepted.
+- Addendum 2026-10-22 (config cleanup, Muse): voice config is now
+  ONE file, `voice.json` {brain_models chain, tts{voice_id, model},
+  first_message, prompt, tools[17]}; `pipecat_voice.py` reads only
+  it. Tools/helpers extracted to `voice_tools.py` (`TOOL_FUNCS`,
+  jobs, ConvMetrics, set_state, key loaders, `speaker_target()`);
+  `voice_agent.py` and its session classes (Grok VoiceSession,
+  ElevenLabsSession, LocalVoiceSession/GeminiBrain/VadSegmenter) are
+  deleted, as are `llm_bridge.py`, `apply_agent.py`,
+  `agent-profile.json`, `voice-config.json`, the
+  `omarchy-llm-bridge.service` unit, the Tailscale Funnel that
+  exposed the bridge, and `LLM_BRIDGE_SECRET`. Pipecat brain is a
+  failover chain (BrainLLM marks itself unusable on 429/503;
+  switch re-asks; RetryObserver revives+re-asks single-flight;
+  15-min revive). FLOW pod gained a visible far-right chevron
+  (`podclose`) that folds the pod - the corner previously closed it
+  invisibly. Test hooks: `OMARCHY_VOICE_MIC`/`OMARCHY_VOICE_SPK`
+  override the pw-record/pw-cat targets for virtual-mic tests.

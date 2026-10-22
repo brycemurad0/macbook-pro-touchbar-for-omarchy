@@ -1,10 +1,11 @@
-# omarchy-touchbar
+# MacBook Pro Touch Bar for Omarchy
 
 A living Touch Bar for [Omarchy](https://omarchy.org/) on Apple Silicon
-MacBooks: an animated system field, real function keys, desktop controls,
-live agent sessions, a fleet/ tmux launcher, and an optional realtime
-voice agent — all rendered directly to the Touch Bar framebuffer with
-the stock `tiny-dfr` kept one command away as the rollback.
+MacBook Pros: an animated system field, real function keys, desktop
+controls, live agent sessions, a fleet/tmux launcher, and an optional
+realtime voice agent — all rendered directly to the Touch Bar
+framebuffer with the stock `tiny-dfr` kept one command away as the
+rollback.
 
 ![FLOW](docs/flow.png)
 
@@ -28,47 +29,58 @@ jumps to its session; tapping the ASCII field around it dismisses it.
 
 ## Voice (optional)
 
-`voice_agent.py` is a live voice agent client. ElevenLabs
-Conversational AI provides ears, turn-taking, and mouth; the persona,
-voice, and brain are versioned in `agent-profile.example.json` and
-applied with `apply_agent.py`; the daemon keeps PipeWire mic/speaker
-I/O and executes the agent's client tools locally — quick checks
-(fleet sessions/status, Mnemos memory recall, shell here or on any
-node, window focus, clipboard, reminders, media) answer by voice,
-while real work is restated as a goal, confirmed out loud, then run
-permissionless in the background by a coding harness (`start_work`)
-and reported once when done. Toggle it from FLOW.
+`pipecat_voice.py` is a live voice agent on
+[Pipecat](https://github.com/pipecat-ai/pipecat): the framework owns
+turn-taking (Silero VAD, end-of-turn, barge-in), and this repo owns
+the machine — PipeWire mic/speaker transports (no inbound exposure;
+every connection is outbound), a Gemini brain with function calling,
+ElevenLabs TTS for the voice itself, and `voice_tools.py`, the local
+tool layer the brain calls: fleet sessions/status, Mnemos memory
+recall + remember, shell here or on any fleet node, Second Brain
+search, daily brief, window focus, URL open, clipboard, reminders,
+media. Quick checks answer by voice; real work follows a spoken
+protocol — the agent restates the goal, names the harness, asks
+*"Want me to run that?"*, and only on a yes launches `start_work`
+(a permissionless coding harness in the background) and reports
+once when it finishes. Toggle it from FLOW's pod.
 
-The brain has two wirings, chosen by `brain` in `voice-config.json`:
+Pipeline: `pw-record` → Silero VAD → Moonshine STT (local, no audio
+leaves the box) → Gemini (brain) → ElevenLabs TTS → `pw-cat` to the
+speaker. The mic is ducked (not muted) while the agent speaks, so
+speaker echo can't self-trigger but a real voice can still barge in.
 
-- `hosted` — ElevenLabs serves the model from their menu
-  (`gemini-3.8-flash` by default). Zero local moving parts.
-- `custom` (wiring B) — `llm_bridge.py` serves `gemini-3.8-flash`
-  from your own Gemini API key in OpenAI-compatible form, exposed to
-  ElevenLabs over Tailscale Funnel behind a generated shared secret;
-  ElevenLabs calls it as a custom LLM. `apply_agent.py` only switches
-  the agent to the bridge when the bridge is up *and* has a key, so
-  the agent can never be stranded on a dead endpoint.
+**Everything voice-shaped is one file: `voice.json`** — the brain
+model chain, ElevenLabs voice id + model, the persona prompt
+(short, sweet, dry wit; `{{node}}`/`{{time}}`/`{{fleet}}` are filled
+in live), the greeting line, and the 17 tool schemas. Keys live only
+in `voice-secrets.env` (mode 600, never committed):
+`ELEVENLABS_API_KEY` and `GEMINI_API_KEY`.
 
-Setup: put `ELEVENLABS_API_KEY` (and `GEMINI_API_KEY` for the custom
-brain) in `~/.config/omarchy/touchbar/voice-secrets.env` (mode 600,
-never committed), copy the two `*.example.json` config files into
-place, and run `python3 apply_agent.py`. xAI Grok Voice (native
-speech-to-speech) remains available as `provider: grok`. Every
-conversation appends one numeric metrics row (length, turns, agent
-characters, answer latency, interruptions, tool calls) to
-`~/.local/state/omarchy-touchbar/voice-metrics.jsonl` — the data that
-will justify (or kill) a future fully-local pipeline.
+The brain is a **failover chain** (`brain_models`, first = your
+pick): Gemini's free tier allows ~20 requests/day on the good Flash
+models, so a single model goes mute mid-evening. A 429/503 marks
+that model out and the conversation re-asks on the next; failed
+turns retry patiently in the background. Expect the greeting to
+take a few extra seconds when the primary is tapped out — and know
+that enabling billing on the Gemini project is what makes the
+primary model simply always answer. Every conversation appends one
+numeric metrics row (turns, words, agent characters, latency, tool
+calls) to `~/.local/state/omarchy-touchbar/voice-metrics.jsonl`.
+
+Test hooks: `OMARCHY_VOICE_MIC` / `OMARCHY_VOICE_SPK` env vars
+override the `pw-record`/`pw-cat` PipeWire targets, so the whole
+conversation loop can be driven through a virtual mic in tests.
 
 ## Install
 
 Requirements: Omarchy on an Apple Silicon MacBook (Touch Bar driven
-by tiny-dfr), Python 3 with `cairo` and `websockets`, `foot`, `tmux`,
-and a Tailscale mesh if you want fleet features.
+by tiny-dfr), Python 3 with `cairo`, `foot`, `tmux`, and a Tailscale
+mesh if you want fleet features. Voice additionally builds a project
+venv (`install.sh` does it) with Pipecat + Moonshine/Silero models.
 
 ```bash
-git clone https://github.com/brycemurad0/omarchy-touchbar
-cd omarchy-touchbar
+git clone https://github.com/brycemurad0/macbook-pro-touchbar-for-omarchy
+cd macbook-pro-touchbar-for-omarchy
 ./install.sh
 ```
 
@@ -93,9 +105,8 @@ Everything machine-specific or preferential is config, never code:
 | File (in `~/.config/omarchy/touchbar/`) | Controls |
 |---|---|
 | `fleet.json` | Display names + ssh aliases per Tailscale node (see `fleet.example.json`) |
-| `voice-config.json` | Voice provider (`elevenlabs`/`grok`), `agent_id`, brain wiring (`hosted`/`custom`) |
-| `agent-profile.json` | Persona prompt, voice name + settings, brain model, tool list, turn patience (applied by `apply_agent.py`) |
-| `voice-secrets.env` | API keys only (`ELEVENLABS_API_KEY`, `GEMINI_API_KEY`); generated bridge secret lands here too. Mode 600, never committed |
+| `voice.json` | All voice config: brain failover chain, ElevenLabs voice, persona prompt, greeting, tool schemas (see `voice.example.json`) |
+| `voice-secrets.env` | API keys only (`ELEVENLABS_API_KEY`, `GEMINI_API_KEY`, optional `MNEMOS_*`). Mode 600, never committed |
 | env `TOUCHBAR_FLOW` | FLOW field preset (default `classic`, the owner-approved field) |
 | env `TOUCHBAR_ROTATE` / `TOUCHBAR_FLIP_X` | Panel orientation / touch mirroring |
 | Theme files | Colors and font come from the active Omarchy theme |
@@ -117,11 +128,11 @@ python3 touchbar.py --snapshot /tmp/tb-snap   # render every view offscreen
 ```
 
 Key sources: `touchbar.py` (daemon, renderer, session discovery),
-`voice_agent.py` (voice client + local tools), `llm_bridge.py`
-(custom brain endpoint), `apply_agent.py` (profile → ElevenLabs
-agent), `test_touchbar.py` / `test_voice_agent.py` (regressions:
-tap matrix, rail priority, session ownership, FLOW field shape,
-voice gain/jobs/metrics/profile consistency).
+`pipecat_voice.py` (Pipecat voice pipeline), `voice_tools.py`
+(local tool layer the brain calls), `test_touchbar.py` /
+`test_voice_tools.py` (regressions: tap matrix, rail priority,
+session ownership, FLOW field shape, pod controls, voice gain/jobs/
+metrics/config consistency).
 
 ## License
 

@@ -4,5 +4,6 @@
   },
   "ssh_aliases": {
     "dns-label": "ssh-config-host"
-  }
+  },
+  "hide_nodes": []
 }

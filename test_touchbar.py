@@ -120,6 +120,55 @@ class DevOffline(unittest.TestCase):
         self.assertIn("Bob", datas)
         self.assertNotIn("Atlas", datas, "offline node must not be a launch target")
 
+class GhostNode(unittest.TestCase):
+    def test_hidden_ghost_peer_never_listed(self):
+        # a retired tailnet entry for this same hardware (its
+        # pre-Linux macOS node) must not show up as a dead machine
+        import json as _json
+        d = make_daemon()
+        payload = {"Self": {"HostName": "fred",
+                            "TailscaleIPs": ["100.64.0.1"]},
+                   "Peer": {
+                       "a": {"HostName": "Fred's MacBook Pro",
+                             "DNSName": "freds-macbook-pro.tail.example.",
+                             "OS": "macOS", "Online": False,
+                             "TailscaleIPs": ["100.64.0.9"]},
+                       "b": {"HostName": "bob",
+                             "DNSName": "bob.tail.example.",
+                             "OS": "linux", "Online": True,
+                             "TailscaleIPs": ["100.64.0.2"]}}}
+
+        class R:
+            stdout = _json.dumps(payload)
+
+        orig_run, orig_hide = tb.subprocess.run, tb.HIDE_NODES
+        tb.subprocess.run = lambda *a, **k: R()
+        tb.HIDE_NODES = {"freds-macbook-pro"}
+        try:
+            d.st._scan_fleet()
+        finally:
+            tb.subprocess.run, tb.HIDE_NODES = orig_run, orig_hide
+        names = [e["name"].lower() for e in d.st.nodes_detail]
+        self.assertNotIn("fred's macbook pro", names)
+        self.assertIn("bob", names)
+
+
+class PodClose(unittest.TestCase):
+    def test_pod_back_button_far_right_folds_pod(self):
+        d = make_daemon()
+        d.renderer.pod_open = True
+        hits = render(d, "flow")
+        h = find(hits, "podclose")
+        self.assertIsNotNone(h, "open pod must draw a back button at the far right")
+        self.assertGreaterEqual(h[0] + h[2], tb.W - 16,
+                                "back button must sit at the pod's far right edge")
+        self.assertGreater(h[0], tb.W - 120)
+        d.pod_open_until = time.monotonic() + 60
+        tap(d, h)
+        self.assertLessEqual(d.pod_open_until, time.monotonic() + 1,
+                             "back button must fold the pod away")
+
+
 class PodVoice(unittest.TestCase):
     def test_pod_has_voice_button_that_toggles(self):
         d = make_daemon()

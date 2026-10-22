@@ -4,7 +4,7 @@ hard part (VAD, end-of-turn, interruptions, streaming TTS), we own the
 machine (PipeWire transport, fleet tools, persona, touchbar state).
 
 Pipeline: pw-record -> Silero VAD -> Moonshine (local STT) -> Gemini
-(brain, function calls to the same local tools as voice_agent.py) ->
+(brain, function calls into voice_tools.py) ->
 ElevenLabs TTS (Sarah) -> pw-cat to the speaker convolver.
 
 No inbound exposure: every connection is outbound. Echo control: the
@@ -12,7 +12,9 @@ mic is ducked (not muted) while the bot speaks, so a loud real voice
 can still barge in but speaker echo cannot self-trigger.
 
 Run with the project venv: .venv/bin/python pipecat_voice.py
-State file and metrics are shared with voice_agent.py's format.
+All voice configuration lives in voice.json next to this file
+(brain chain, ElevenLabs voice, persona prompt, tool schemas); keys
+live in voice-secrets.env. Tools/state/metrics: voice_tools.py.
 """
 import asyncio
 import json
@@ -24,7 +26,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import voice_agent as va  # tools, metrics, state, secrets helpers
+import voice_tools as vt  # tools, metrics, state, secrets
 
 from loguru import logger
 
@@ -35,6 +37,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    ErrorFrame,
     Frame,
     InputAudioRawFrame,
     LLMContextAssistantTurnFrame,
@@ -43,7 +46,10 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
 )
+from pipecat.observers.base_observer import BaseObserver, FrameProcessed
+from pipecat.pipeline.llm_switcher import LLMSwitcher
 from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.service_switcher import ServiceSwitcherStrategyFailover
 from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -88,9 +94,14 @@ class PwInputTransport(BaseInputTransport):
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
+        args = ["pw-record", "--rate", str(self.sample_rate),
+                "--channels", "1", "--format", "s16"]
+        mic = os.environ.get("OMARCHY_VOICE_MIC")  # test hook: virtual mic
+        if mic:
+            args += ["--target", mic]
+        args.append("-")
         self._proc = await asyncio.create_subprocess_exec(
-            "pw-record", "--rate", str(self.sample_rate), "--channels", "1",
-            "--format", "s16", "-",
+            *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         self._task = self.create_task(self._read_loop())
         await self.set_transport_ready(frame)
@@ -102,9 +113,9 @@ class PwInputTransport(BaseInputTransport):
             if not data:
                 break
             if self._duck.ducking:
-                data = va._gain_pcm(data, 0.15)
+                data = vt._gain_pcm(data, 0.15)
             else:
-                data = va._gain_pcm(data, 2.0)
+                data = vt._gain_pcm(data, 2.0)
             await self.push_audio_frame(InputAudioRawFrame(
                 audio=data, sample_rate=self.sample_rate, num_channels=1))
 
@@ -127,7 +138,7 @@ class PwOutputTransport(BaseOutputTransport):
         await super().start(frame)
         args = ["pw-cat", "--playback", "--raw", "--rate",
                 str(self.sample_rate), "--channels", "1", "--format", "s16"]
-        target = va.VoiceSession._speaker_target()
+        target = os.environ.get("OMARCHY_VOICE_SPK") or vt.speaker_target()
         if target:
             args += ["--target", target]
         args.append("-")
@@ -177,9 +188,10 @@ class HeardObserver(FrameProcessor):
     """Sits between STT and the user aggregator: transcriptions are
     consumed by the aggregator, so receipts are logged here."""
 
-    def __init__(self, metrics):
+    def __init__(self, metrics, health):
         super().__init__()
         self.metrics = metrics
+        self.health = health
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -187,8 +199,27 @@ class HeardObserver(FrameProcessor):
             print("heard:", frame.text[:200], flush=True)
             self.metrics.note_speech()
             self.metrics.user_spoke(frame.text)
-            va.set_state(True, "thinking")
+            self.health["awaiting"] = True
+            vt.set_state(True, "thinking")
         await self.push_frame(frame, direction)
+
+
+class RetryObserver(BaseObserver):
+    """When a brain error lands while a reply is owed, schedule a
+    patient revive-and-reask instead of going mute: Gemini capacity
+    (503) clears in tens of seconds, and even daily quotas roll."""
+
+    def __init__(self, health, kick):
+        super().__init__()
+        self.health = health
+        self.kick = kick
+
+    async def on_process_frame(self, data: FrameProcessed):
+        if isinstance(data.frame, ErrorFrame) and self.health["awaiting"]:
+            text = str(data.frame.error)
+            if any(k in text for k in ("429", "RESOURCE_EXHAUSTED",
+                                       "503", "UNAVAILABLE")):
+                self.kick()
 
 
 class StateObserver(FrameProcessor):
@@ -196,9 +227,12 @@ class StateObserver(FrameProcessor):
     the same shape the other voice backends produce. Assistant text
     arrives aggregated as LLMContextAssistantTurnFrame."""
 
-    def __init__(self, metrics):
+    def __init__(self, metrics, health):
         super().__init__()
         self.metrics = metrics
+        self.health = health
+        self.on_quota = None  # set by amain: re-ask the dead turn once
+        self._last_reask = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -206,11 +240,22 @@ class StateObserver(FrameProcessor):
                 and frame.text.strip():
             print("assistant:", frame.text[:200], flush=True)
             self.metrics.agent_replied(frame.text)
+            self.health["awaiting"] = False
+            self.health["retries"] = 0
+            self.health["reask_pending"] = False
         elif isinstance(frame, BotStartedSpeakingFrame):
             self.metrics.first_audio()
-            va.set_state(True, "speaking")
+            vt.set_state(True, "speaking")
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            va.set_state(True, "listening")
+            vt.set_state(True, "listening")
+        elif isinstance(frame, ErrorFrame):
+            text = str(frame.error)
+            if "429" in text or "QUOTA" in text.upper():
+                vt.set_state(True, "brain quota out")
+                now = time.monotonic()
+                if self.on_quota and now - self._last_reask > 15:
+                    self._last_reask = now
+                    self.on_quota()
         await self.push_frame(frame, direction)
 
 
@@ -227,11 +272,11 @@ def build_tools(profile):
 
 
 def register_tools(llm):
-    for name, func in va.EL_TOOL_FUNCS.items():
+    for name, func in vt.TOOL_FUNCS.items():
         async def handler(params, _func=func, _name=name):
             print(f"tool call: {_name} {str(params.arguments)[:120]}",
                   flush=True)
-            va.set_state(True, f"tool: {_name}")
+            vt.set_state(True, f"tool: {_name}")
             try:
                 result = await asyncio.to_thread(
                     _func, dict(params.arguments or {}))
@@ -242,40 +287,70 @@ def register_tools(llm):
 
 
 # -------------------------------------------------------------------- main
+class BrainLLM(GoogleLLMService):
+    """Marks itself unusable on quota/capacity errors so the failover
+    switcher moves on; a bare 429 would otherwise read as a hiccup the
+    service 'can carry on from' and the turn dies silently."""
+
+    async def push_error(self, error_msg, exception=None, fatal=False,
+                         category=None, force_treat_as_permanent=False):
+        text = f"{error_msg} {exception}"
+        if any(k in text for k in ("429", "RESOURCE_EXHAUSTED", "503",
+                                   "UNAVAILABLE")):
+            force_treat_as_permanent = True
+        await super().push_error(
+            error_msg, exception=exception, fatal=fatal, category=category,
+            force_treat_as_permanent=force_treat_as_permanent)
+
+
+def build_brain(gkey, cfg, system):
+    """Gemini free-tier quotas are per-model per-day and tiny (3.8:
+    20/day), so a single model silently dies mid-evening. voice.json's
+    brain_models list is a failover chain: a 429/503 moves the
+    conversation to the next model instead of going mute."""
+    models = list(dict.fromkeys(
+        m for m in (cfg.get("brain_models") or []) if m))
+    llms = []
+    for model in models:
+        svc = BrainLLM(
+            api_key=gkey, model=model, system_instruction=system,
+            params=GoogleLLMService.InputParams(temperature=0.7))
+        register_tools(svc)
+        llms.append(svc)
+    print(f"brain chain: {' -> '.join(models)}", flush=True)
+    if len(llms) == 1:
+        return llms[0], llms
+    return LLMSwitcher(llms=llms,
+                       strategy_type=ServiceSwitcherStrategyFailover), llms
+
+
 async def amain():
-    cfg = va.load_config()
-    profile = json.load(open(os.path.join(BASE, "agent-profile.json")))
-    gkey = va._gemini_key()
-    el_key = va.resolve_elevenlabs_key()
+    cfg = json.load(open(os.path.join(BASE, "voice.json")))
+    gkey = vt._gemini_key()
+    el_key = vt.resolve_elevenlabs_key()
     if not gkey or not el_key:
-        va.set_state(True, "sign-in needed")
+        vt.set_state(True, "sign-in needed")
         print("pipecat voice needs GEMINI_API_KEY and ELEVENLABS_API_KEY "
               "in voice-secrets.env", flush=True)
         while True:
             await asyncio.sleep(30)
-
     import datetime
-    system = (profile["prompt"]
+    system = (cfg["prompt"]
               .replace("{{node}}", os.uname().nodename)
               .replace("{{time}}", datetime.datetime.now().strftime(
                   "%A %H:%M"))
-              .replace("{{fleet}}", va.tool_fleet_status()))
+              .replace("{{fleet}}", vt.tool_fleet_status()))
     transport = PwTransport(TransportParams(
         audio_in_enabled=True, audio_out_enabled=True,
         audio_in_sample_rate=RATE, audio_out_sample_rate=RATE))
     stt = MoonshineSTTService()
-    llm = GoogleLLMService(
-        api_key=gkey, model=cfg.get("brain_model", "gemini-3.8-flash"),
-        system_instruction=system,
-        params=GoogleLLMService.InputParams(temperature=0.7))
-    register_tools(llm)
+    llm, brain_members = build_brain(gkey, cfg, system)
     tts = ElevenLabsTTSService(
         api_key=el_key,
-        voice_id=cfg.get("tts_voice_id", "EXAVITQu4vr4xnSDxMaL"),
-        settings=ElevenLabsTTSService.Settings(
-            model=profile.get("tts_model", "eleven_flash_v2")),
+        voice_id=cfg["tts"]["voice_id"],
+        settings=ElevenLabsTTSService.Settings(model=cfg["tts"]["model"]),
         sample_rate=RATE)
-    context = LLMContext(tools=build_tools(profile))
+    context = LLMContext(tools=build_tools(cfg))
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -283,13 +358,40 @@ async def amain():
                 confidence=0.6, start_secs=0.25, stop_secs=0.55,
                 min_volume=0.55)),
             user_turn_stop_timeout=1.2))
-    metrics = va.ConvMetrics()
-    observer = StateObserver(metrics)
+    metrics = vt.ConvMetrics()
+    health = {"awaiting": True, "retries": 0,
+              "reask_pending": False}  # greeting is owed
+    observer = StateObserver(metrics, health)
     pipeline = Pipeline([
-        transport.input(), stt, HeardObserver(metrics), aggregators.user(),
+        transport.input(), stt, HeardObserver(metrics, health),
+        aggregators.user(),
         llm, tts, transport.output(), aggregators.assistant(), observer])
     worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
     runner = WorkerRunner(handle_sigint=False)
+
+    _retry_task = None
+
+    def kick():
+        nonlocal _retry_task
+        if _retry_task and not _retry_task.done():
+            return
+
+        async def retry():
+            delay = min(20 * 2 ** health["retries"], 120)
+            health["retries"] += 1
+            print(f"brain retry {health['retries']} in {delay}s",
+                  flush=True)
+            await asyncio.sleep(delay)
+            health["reask_pending"] = False
+            if not health["awaiting"]:
+                return
+            for svc in brain_members:
+                await svc.set_usable(True)
+            await worker.queue_frames([LLMRunFrame()])
+
+        _retry_task = asyncio.create_task(retry())
+
+    worker.add_observer(RetryObserver(health, kick))
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -304,7 +406,7 @@ async def amain():
     async def announcer():
         while not stop.is_set():
             await asyncio.sleep(5)
-            for jid, st in va.pop_finished_jobs():
+            for jid, st in vt.pop_finished_jobs():
                 context.add_message({
                     "role": "user",
                     "content": f"[Background job {jid} ({st['goal'][:80]}) "
@@ -314,7 +416,7 @@ async def amain():
                 await worker.queue_frames([LLMRunFrame()])
 
     await runner.add_workers(worker)
-    va.set_state(True, "listening")
+    vt.set_state(True, "listening")
     context.add_message({
         "role": "user",
         "content": "[The owner just toggled voice on. Open with your "
@@ -327,16 +429,47 @@ async def amain():
     asyncio.create_task(greet())
     print("pipecat voice up: Silero + Moonshine + Gemini + ElevenLabs",
           flush=True)
+    async def reask():
+        # single-flight: the switch-event re-ask and the delayed
+        # revive-retry must never both re-run a turn (ghost replies)
+        if health["reask_pending"]:
+            return
+        health["reask_pending"] = True
+        await asyncio.sleep(1.2)  # let the failover switch land
+        if health["awaiting"]:
+            await worker.queue_frames([LLMRunFrame()])
+
+    observer.on_quota = lambda: asyncio.create_task(reask())
+    if isinstance(llm, LLMSwitcher):
+        @llm.strategy.event_handler("on_service_switched")
+        async def _on_switched(strategy, service):
+            print(f"brain switched -> {service}", flush=True)
+            asyncio.create_task(reask())
+
+    async def revive_brains():
+        while not stop.is_set():
+            await asyncio.sleep(900)
+            for svc in brain_members:
+                await svc.set_usable(True)  # quotas heal; retry primary
+
     hb = asyncio.create_task(heartbeat())
     ann = asyncio.create_task(announcer())
+    rev = asyncio.create_task(revive_brains())
     run_task = asyncio.create_task(runner.run())
     stop_task = asyncio.create_task(stop.wait())
     await asyncio.wait([run_task, stop_task],
                        return_when=asyncio.FIRST_COMPLETED)
     hb.cancel()
     ann.cancel()
+    rev.cancel()
+    if stop.is_set():
+        await worker.stop()  # graceful pipeline shutdown on SIGTERM
+        try:
+            await asyncio.wait_for(run_task, 4)
+        except asyncio.TimeoutError:
+            run_task.cancel()
     metrics.flush()
-    va.set_state(False, "")
+    vt.set_state(False, "")
     print("pipecat voice stopped", flush=True)
 
 

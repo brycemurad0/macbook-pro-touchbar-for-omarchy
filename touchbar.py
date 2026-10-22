@@ -96,6 +96,9 @@ _FLEET_CFG = _fleet_config()
 NODE_ALIASES = _FLEET_CFG.get("node_aliases") or {}
 # tailscale DNS label -> fleet ssh alias (from ~/.ssh/config)
 SSH_ALIASES = _FLEET_CFG.get("ssh_aliases") or {}
+# DNS labels never shown (e.g. a machine's retired pre-Linux tailnet
+# ghost: same hardware, dead entry, not a real second machine)
+HIDE_NODES = {str(x).lower() for x in (_FLEET_CFG.get("hide_nodes") or [])}
 # how to resume each harness's last session (used inside tmux on tap)
 RESUME_CMD = {
     "pi": "pi --continue",
@@ -1030,6 +1033,8 @@ class State:
                     continue  # phones: not ssh targets
                 name = peer.get("HostName") or peer.get("DNSName", "").split(".")[0]
                 host = (peer.get("DNSName") or name).rstrip(".")
+                if host.split(".")[0].lower() in HIDE_NODES:
+                    continue  # retired ghost of a live machine (fleet.json)
                 friendly = node_alias(name, host)
                 online = bool(peer.get("Online"))
                 if online:
@@ -2055,6 +2060,23 @@ class Renderer:
             self.media_icon(ctx, icon, bx + 30, 30, 13,
                             self.th["darker_background"] if is_pressed else self.th["bright_foreground"])
             hits.append((bx, 9, 60, 42, "media", (name, code)))
+        # visible fold-away button at the far right: this corner used
+        # to close the pod invisibly via the field-tap catch-all
+        bx = px + self.POD_W - 52
+        is_pressed = pressed.get("podclose", 0) > time.monotonic()
+        self.rr(ctx, bx, 9, 46, 42, 9)
+        ctx.set_source_rgba(*(self.th["accent"] if is_pressed else self.th["lighter_background"]),
+                            0.9 if is_pressed else 0.65)
+        ctx.fill()
+        cc = self.th["darker_background"] if is_pressed else self.th["bright_foreground"]
+        ctx.set_source_rgb(*cc)
+        ctx.set_line_width(2.4)
+        ctx.new_path()  # right chevron: folds back toward the edge
+        ctx.move_to(bx + 18, 21)
+        ctx.line_to(bx + 29, 30)
+        ctx.line_to(bx + 18, 39)
+        ctx.stroke()
+        hits.append((bx, 9, 46, 42, "podclose", None))
 
     @staticmethod
     def batt_color(pct, charging):
@@ -2903,6 +2925,9 @@ class Daemon:
             self.view = "flow"
         elif kind == "podopen":
             self.pod_open_until = time.monotonic() + 7
+        elif kind == "podclose":
+            self.pressed["podclose"] = time.monotonic() + 0.18
+            self.pod_open_until = 0.0
         elif kind == "view":
             self.view = data
             self.live_sel = None
