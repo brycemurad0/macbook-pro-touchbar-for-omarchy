@@ -289,3 +289,16 @@ class RemoteSessions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FlowFrozen(unittest.TestCase):
+    def test_flow_owner_frozen(self):
+        # Owner froze this look 2026-10-22 after repeated retunes:
+        # slow streaming waves, dead space at rest, density follows
+        # fleet agent work. Changing these numbers requires the
+        # owner watching — update this pin in the same commit as an
+        # owner-approved retune, never silently.
+        self.assertEqual(tb.FLOW_PRESETS["classic"], {
+            "ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.035,
+            "spiral_spd": (0.05, 0.08), "inten": (-0.06, 0.52),
+            "smooth": 0.08, "current": 0.13, "levels": 1.0})
