@@ -403,15 +403,18 @@ def build_brain(cfg, system):
                 svc = BrainAnthropicLLM(
                     api_key=key, model=model,
                     params=AnthropicLLMService.InputParams(temperature=0.7))
-        elif provider in ("openai", "openrouter"):
-            key = _secret("OPENAI_API_KEY" if provider == "openai"
-                          else "OPENROUTER_API_KEY")
+        elif provider in ("openai", "openrouter", "minimax"):
+            key = _secret({"openai": "OPENAI_API_KEY",
+                           "openrouter": "OPENROUTER_API_KEY",
+                           "minimax": "MINIMAX_API_KEY"}[provider])
             if key:
                 kw = {"api_key": key, "model": model,
                       "params": OpenAILLMService.InputParams(
                           temperature=0.7)}
                 if provider == "openrouter":
                     kw["base_url"] = "https://openrouter.ai/api/v1"
+                elif provider == "minimax":
+                    kw["base_url"] = "https://api.minimax.io/v1"
                 svc = BrainOpenAILLM(**kw)
         if svc is None:
             print(f"brain skip {spec}: no key / unknown provider",

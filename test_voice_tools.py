@@ -101,7 +101,7 @@ class VoiceConfigTests(unittest.TestCase):
 
     def test_brain_chain_entries_parse(self):
         # 'provider:model', bare = google; providers the daemon knows
-        known = {"google", "anthropic", "openai", "openrouter"}
+        known = {"google", "anthropic", "openai", "openrouter", "minimax"}
         for spec in self.cfg["brain_models"]:
             provider, _, model = spec.partition(":")
             if model:
