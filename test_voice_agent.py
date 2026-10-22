@@ -1,10 +1,14 @@
 import json
 import os
 import struct
+import subprocess
 import time
 import unittest
 
 import voice_agent as va
+
+# captured before test_touchbar swaps subprocess.Popen for its fake
+_REAL_POPEN = subprocess.Popen
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,6 +33,9 @@ class GainTests(unittest.TestCase):
 
 
 class JobTests(unittest.TestCase):
+    def setUp(self):
+        subprocess.Popen = _REAL_POPEN
+
     def test_job_lifecycle(self):
         va.HARNESS_CMDS["t-ok"] = ["true"]
         va.HARNESS_CMDS["t-bad"] = ["false"]
@@ -56,6 +63,7 @@ class JobTests(unittest.TestCase):
 class MetricsTests(unittest.TestCase):
     def test_summary_math(self):
         m = va.ConvMetrics()
+        m.note_speech()  # mic energy while the user was talking
         m.user_spoke("what is the battery status")
         m.first_audio()
         m.agent_replied("Eighty percent.")
@@ -73,8 +81,16 @@ class MetricsTests(unittest.TestCase):
 
 class ProfileTests(unittest.TestCase):
     def test_profile_shape_and_persona_rules(self):
-        profile = json.load(open(os.path.join(BASE, "agent-profile.json")))
+        path = os.path.join(BASE, "agent-profile.json")
+        if not os.path.exists(path):  # fresh clone: only the example ships
+            path = os.path.join(BASE, "agent-profile.example.json")
+        profile = json.load(open(path))
         self.assertIn("flash", profile["llm"])
+        # turn settings live in their own block (a flat "conversation"
+        # block silently drops them server-side); patient eagerness is
+        # what stops it grabbing the turn during a mid-sentence pause
+        self.assertEqual(profile["turn"]["turn_eagerness"], "patient")
+        self.assertNotIn("turn_timeout", profile["conversation"])
         prompt = profile["prompt"].lower()
         for rule in ("never monologue", "want me to run that",
                      "start_work", "one or two sentences"):
@@ -124,6 +140,8 @@ class ProfileTests(unittest.TestCase):
         self.assertIsNone(va._resolve_node(""))
         self.assertEqual(va._resolve_node("no-such-node-xyz"), "unknown")
         node = va._resolve_node("bob")
+        if node == "unknown":
+            self.skipTest("fleet not enumerable in this environment")
         self.assertIn(node["display"].lower(), ("bob",))
 
 

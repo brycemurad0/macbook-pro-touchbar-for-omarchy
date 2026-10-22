@@ -1,5 +1,6 @@
 {
   "provider": "elevenlabs",
   "agent_id": "agent_xxxxxxxx",
-  "voice": null
+  "voice": null,
+  "brain": "custom"
 }

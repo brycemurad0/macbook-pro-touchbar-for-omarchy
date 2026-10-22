@@ -10,6 +10,7 @@ Usage: python3 apply_agent.py
 """
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -46,6 +47,57 @@ def call(key, method, path, body=None):
         raise SystemExit(f"{method} {path} -> HTTP {exc.code}: {detail}")
 
 
+def bridge_url():
+    if os.environ.get("LLM_BRIDGE_URL"):
+        return os.environ["LLM_BRIDGE_URL"].rstrip("/")
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"],
+                             capture_output=True, text=True, timeout=6).stdout
+        dns = json.loads(out)["Self"]["DNSName"].rstrip(".")
+        return f"https://{dns}/v1/chat/completions"
+    except Exception:
+        return None
+
+
+def bridge_ready():
+    """(url, secret) if the local bridge is up AND has a Gemini key."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8911/health",
+                                    timeout=4) as resp:
+            health = json.load(resp)
+    except Exception:
+        return None, None
+    if not health.get("key"):
+        return None, None
+    sec = {}
+    try:
+        for line in open(SECRETS):
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                sec[k] = v
+    except OSError:
+        pass
+    if not sec.get("LLM_BRIDGE_SECRET"):
+        return None, None
+    return bridge_url(), sec["LLM_BRIDGE_SECRET"]
+
+
+def workspace_secret(key, name, value):
+    """Create or reuse an ElevenLabs workspace secret; return its id."""
+    try:
+        existing = call(key, "GET", "/workspace/secrets")
+        items = existing if isinstance(existing, list) \
+            else existing.get("secrets", [])
+        for s in items:
+            if s.get("name") == name:
+                return s.get("secret_id")
+    except SystemExit:
+        pass
+    created = call(key, "POST", "/workspace/secrets",
+                   {"type": "new", "name": name, "value": value})
+    return created.get("secret_id")
+
+
 def main():
     key = api_key()
     if not key:
@@ -65,21 +117,40 @@ def main():
               "parameters": t["parameters"], "expects_response": True}
              for t in profile["tools"]]
     cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
-    llm_candidates = [profile["llm"], "gemini-3.8-flash",
-                      "gemini-3.7-flash", "gemini-3.5-flash",
-                      "gemini-2.5-flash", "gpt-4.1-mini"]
+    # wiring B: if config asks for the custom brain and the local bridge
+    # is actually ready (up + Gemini key), serve gemini-3.8-flash from
+    # our own endpoint; otherwise stay on the hosted model - never
+    # strand the agent on a dead endpoint
+    custom = None
+    if cfg.get("brain") == "custom":
+        url, secret = bridge_ready()
+        if url:
+            sid = workspace_secret(key, "OMARCHY_LLM_BRIDGE", secret)
+            if sid:
+                custom = {"url": url, "model_id": "gemini-3.8-flash",
+                          "api_key": {"secret_id": sid}}
+                print(f"brain: custom bridge {url}")
+        if not custom:
+            print("brain: custom requested but bridge not ready "
+                  "(needs GEMINI_API_KEY); staying hosted", file=sys.stderr)
+    llm_candidates = (["custom-llm"] if custom else []) + [
+        profile["llm"], "gemini-3.8-flash", "gemini-3.7-flash",
+        "gemini-3.5-flash", "gemini-2.5-flash", "gpt-4.1-mini"]
     agent_id = cfg.get("agent_id")
     last_err = None
     for llm in dict.fromkeys(llm_candidates):
+        prompt_cfg = {"prompt": profile["prompt"], "llm": llm,
+                      "temperature": profile["temperature"],
+                      "tools": tools}
+        if llm == "custom-llm":
+            prompt_cfg["custom_llm"] = custom
         body = {
             "name": profile["name"],
             "conversation_config": {
                 "agent": {
                     "first_message": profile["first_message"],
                     "language": profile["language"],
-                    "prompt": {"prompt": profile["prompt"], "llm": llm,
-                               "temperature": profile["temperature"],
-                               "tools": tools}},
+                    "prompt": prompt_cfg},
                 "asr": {"user_input_audio_format":
                         profile["audio"]["input_format"]},
                 "tts": {"model_id": profile["tts_model"],

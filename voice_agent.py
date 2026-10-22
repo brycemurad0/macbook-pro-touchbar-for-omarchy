@@ -550,7 +550,13 @@ def _sessions_on(node):
     return [{"name": s, "kind": by_sess.get(s, "shell")} for s in sessions]
 
 
+_fleet_sessions_cache = (0.0, "")
+
+
 def tool_fleet_sessions():
+    global _fleet_sessions_cache
+    if time.time() - _fleet_sessions_cache[0] < 30:
+        return _fleet_sessions_cache[1]
     from concurrent.futures import ThreadPoolExecutor
     nodes = _fleet_nodes()
     if not nodes:
@@ -569,7 +575,9 @@ def tool_fleet_sessions():
         return f"{node['display']}: {inner}"
 
     with ThreadPoolExecutor(max_workers=6) as ex:
-        return ". ".join(ex.map(describe, nodes))
+        result = ". ".join(ex.map(describe, nodes))
+    _fleet_sessions_cache = (time.time(), result)
+    return result
 
 
 def tool_node_status(node_query):
@@ -1132,10 +1140,15 @@ class ConvMetrics:
         self.latencies = []
         self._last_user_event = 0.0
 
+    def note_speech(self):
+        """Called by the mic loop while real voice energy is present;
+        latency is measured from actual speech end, not from when the
+        transcript event happens to arrive (that read ~0.0s, useless)."""
+        self._last_user_event = time.time()
+
     def user_spoke(self, transcript):
         self.user_turns += 1
         self.user_words += len((transcript or "").split())
-        self._last_user_event = time.time()
 
     def first_audio(self):
         if self._last_user_event:
@@ -1187,6 +1200,8 @@ class ElevenLabsSession:
         self.status = "listening"
         self.closed = False
         self._last_audio = 0.0
+        self._final_at = 0.0
+        self._play_end = 0.0
         self._out_rate = EL_RATE
         self._announcer_live = False
         self.metrics = ConvMetrics()
@@ -1197,11 +1212,12 @@ class ElevenLabsSession:
 
     @property
     def speaking(self):
-        # audio keeps leaving the speakers ~1s after the last chunk
-        # arrives (pw-cat + convolver buffering); the mic must stay
-        # gated for that whole tail or the agent hears itself, ASR
-        # transcribes it as the user, and it converses with itself
-        return time.time() - self._last_audio < 1.15
+        # Track real playback drain, not timers: every audio chunk
+        # extends _play_end by its own duration, so the gate follows
+        # how much sound is actually still queued in pw-cat + the
+        # convolver (which drains seconds behind the final chunk -
+        # a fixed tail kept leaking the greeting's last words).
+        return time.time() < self._play_end + 0.8
 
     def _start_player(self):
         args = ["pw-cat", "--playback", "--raw", "--rate", str(self._out_rate),
@@ -1227,6 +1243,8 @@ class ElevenLabsSession:
         # user barged in: drop everything queued for the speakers
         self._stop_player()
         self._last_audio = 0.0
+        self._final_at = 0.0
+        self._play_end = time.time() + 0.3  # convolver ring-out only
 
     async def mic_loop(self):
         while not self.closed:
@@ -1241,6 +1259,11 @@ class ElevenLabsSession:
                     if not raw:
                         print("mic stream ended; respawning capture", flush=True)
                         break
+                    if not self.speaking and len(raw) >= 2:
+                        n = len(raw) // 2
+                        s = struct.unpack(f"<{n}h", raw[:n * 2])
+                        if (sum(x * x for x in s) / n) ** 0.5 > 120:
+                            self.metrics.note_speech()
                     # half-duplex while the agent speaks (+ tail): no
                     # echo canceller on this path, and even ducked echo
                     # was enough for ASR to transcribe the agent as the
@@ -1299,11 +1322,19 @@ class ElevenLabsSession:
                 self._announcer_live = True
                 self._st("listening")
             elif t == "audio":
-                audio = (ev.get("audio_event") or {}).get("audio_base_64", "")
+                aev = ev.get("audio_event") or {}
+                audio = aev.get("audio_base_64", "")
                 if not audio:
                     continue
                 self.metrics.first_audio()
                 self._last_audio = time.time()
+                if aev.get("is_final"):
+                    self._final_at = time.time()
+                # queued playback: this chunk sounds at
+                # max(now, previous queue end) and lasts len/rate
+                nbytes = len(base64.b64decode(audio))
+                self._play_end = max(time.time(), self._play_end) \
+                    + nbytes / 2 / self._out_rate
                 if self.player is None or self.player.poll() is not None:
                     self._start_player()
                 try:
