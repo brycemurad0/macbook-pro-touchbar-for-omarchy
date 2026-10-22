@@ -147,6 +147,73 @@ class NotificationDismiss(unittest.TestCase):
         self.assertIsNone(d.renderer.notification)
         self.assertIsNone(d.renderer._notif_rect)
 
+class FlowChips(unittest.TestCase):
+    def test_batt_color_thresholds(self):
+        bc = tb.Renderer.batt_color
+        self.assertEqual(bc(12, True), (0.35, 0.85, 0.45))   # charging wins
+        self.assertEqual(bc(20, False), (0.95, 0.36, 0.33))  # red <= 20
+        self.assertEqual(bc(21, False), (0.98, 0.76, 0.28))  # amber
+        self.assertEqual(bc(50, False), (0.98, 0.76, 0.28))  # amber at 50
+        self.assertEqual(bc(51, False), (0.35, 0.85, 0.45))  # green above
+
+    def test_flow_renders_with_and_without_battery(self):
+        d = make_daemon()
+        for batt, chg in ((86, False), (12, True), (-1, False)):
+            d.st.battery, d.st.charging = batt, chg
+            hits = render(d, "flow")
+            pill = find(hits, "view", "fleet")
+            self.assertIsNotNone(pill)
+            # compact and centered: well inside the open field, and
+            # far narrower than it (the ASCII art must show around it)
+            zone = tb.W - 140 - (tb.RAIL_W + 12)
+            self.assertLess(pill[2], zone * 0.45)
+            self.assertGreater(pill[0], tb.RAIL_W + 100)
+
+    def test_flow_handle_hit_present(self):
+        d = make_daemon()
+        hits = render(d, "flow")
+        self.assertIsNotNone(find(hits, "podopen"))
+
+    def test_flow_field_continuous_across_restart(self):
+        # two fresh renderers (a restart) must produce the same field:
+        # phases are wall-time based and the first frame snaps, so the
+        # owner-approved river does not reset to a bare dot grid
+        import cairo
+        grids = []
+        for _ in range(2):
+            r = tb.Renderer(tb.Theme(), tb.State())
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, tb.W, tb.H)
+            ctx = cairo.Context(surf)
+            r.view_flow(ctx, [], time.monotonic(), {})
+            grids.append(list(r._smooth))
+        diffs = [abs(a - b) for a, b in zip(*grids)]
+        self.assertTrue(any(v > 0.03 for v in grids[0]),
+                        "field must be developed on the first frame")
+        self.assertLess(max(diffs), 0.05)
+
+    def test_flow_weightings_vary_and_scale(self):
+        # the owner-approved field: smooth gradations across the glyph
+        # ramp (not a binary on/off field), and weighting that scales
+        # with energy. This pins the approved look; retune only with
+        # the owner watching.
+        import cairo
+
+        def probe(energy):
+            st = tb.State()
+            st.energy = energy
+            r = tb.Renderer(tb.Theme(), st)
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, tb.W, tb.H)
+            r.view_flow(cairo.Context(surf), [], time.monotonic(), {})
+            levels = {min(int(v * 12), 11) for v in r._smooth if v >= 0.03}
+            return levels, max(r._smooth)
+
+        levels, idle_max = probe(0.0)
+        self.assertGreaterEqual(len(levels), 4,
+                                "field must shade across glyph weights")
+        _, full_max = probe(1.0)
+        self.assertGreater(full_max, idle_max * 1.8)
+
+
 class RemoteSessions(unittest.TestCase):
     def test_only_tmux_hosted_harnesses_are_sessions(self):
         e = {"name": "Node A", "ssh": "node-a"}

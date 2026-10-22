@@ -1838,6 +1838,11 @@ class Renderer:
         # per-frame easing keeps the current from micro-lurching)
         e = self._e_smooth = lerp(getattr(self, "_e_smooth", self.st.energy),
                                   self.st.energy, 0.04)
+        # field phases run on wall time, not process time: a daemon
+        # restart rejoins the same river at the same phase instead of
+        # resetting to a bare dot grid (owner-approved look, frozen).
+        # `t` (monotonic) still drives ripples/touch expiry.
+        ft = time.time()
         ctx.set_source_rgba(*self.th["darker_background"], 1)
         ctx.rectangle(0, 0, W, H)
         ctx.fill()
@@ -1859,19 +1864,19 @@ class Renderer:
         spirals = [(W * 0.30, -H * 1.7, 1, 2, 0.95),
                    (W * 0.72, H * 2.7, -1, 3, 0.75)]
         _spd = self.style["spiral_spd"]
-        spiral_t = t * (_spd[0] + _spd[1] * e)
+        spiral_t = ft * (_spd[0] + _spd[1] * e)
         self.ripples = [r for r in self.ripples if t - r[2] < 1.8]
         touch_on = bool(self.ripples) or \
             (self.touch_xy and t - self.touch_t < 2.5)
         # per-row trig factors for the base current: sin(p + o) factorization
         row_f = []
         for r in range(rows):
-            b = math.sin(r * 0.9 + t * speed * 0.37) * amp
+            b = math.sin(r * 0.9 + ft * speed * 0.37) * amp
             row_f.append((math.sin(b), math.cos(b), math.sin(r * 1.7), math.cos(r * 1.7)))
         for cxi in range(cols):
             x = cxi * cw
-            p1 = x * 0.011 + t * speed
-            p2 = x * 0.023 - t * speed * 0.62
+            p1 = x * 0.011 + ft * speed
+            p2 = x * 0.023 - ft * speed * 0.62
             s1, c1 = math.sin(p1), math.cos(p1)
             s2, c2 = math.sin(p2), math.cos(p2)
             for r in range(rows):
@@ -1893,10 +1898,14 @@ class Renderer:
                               + (_ib + lvl * 0.36 * e) * height) ** 1.1
                 # temporal smoothing: cells ease toward their target instead
                 # of snapping every frame (kills the jumping/flicker);
-                # faster while touching so ripples track the finger
+                # faster while touching so ripples track the finger.
+                # First frame after start snaps: no warm-up fade, the
+                # river is simply there (pairs with wall-time phases).
                 key = r * cols + cxi
                 prev = self._smooth[key]
-                inten = prev + (inten - prev) * (0.30 if touch_on else self.style.get("smooth", 0.14))
+                factor = 1.0 if not getattr(self, "_flow_warm", False) \
+                    else (0.30 if touch_on else self.style.get("smooth", 0.14))
+                inten = prev + (inten - prev) * factor
                 self._smooth[key] = inten
                 if inten < 0.03:
                     continue
@@ -1904,6 +1913,7 @@ class Renderer:
                 ci = min(int(inten * (FLOW_COLORS - 1)), FLOW_COLORS - 1)
                 ctx.set_source_surface(self.atlas[ci][gi], x, ybase)
                 ctx.paint_with_alpha(clamp(0.25 + inten))
+        self._flow_warm = True
         # vignette edges
         for side in (0, 1):
             grad = cairo.LinearGradient(W * side, 0, W * side + (90 if side == 0 else -90), 0) \
@@ -1975,16 +1985,18 @@ class Renderer:
         col = self.th["dark_foreground"]
         ctx.set_source_rgba(*col, 0.95)
         ctx.set_line_width(1.6)
+        # sun and speaker share one optical size (~17px boxes): the sun
+        # used to dwarf the speaker glyph in this little tab
         ctx.new_path()  # sun
-        ctx.arc(cx, 20, 5, 0, 6.29)
+        ctx.arc(cx, 20, 4.2, 0, 6.29)
         ctx.stroke()
         for a in range(8):
             ang = a * 0.785
             ctx.new_path()
-            ctx.move_to(cx + 8 * math.cos(ang), 20 + 8 * math.sin(ang))
-            ctx.line_to(cx + 10.5 * math.cos(ang), 20 + 10.5 * math.sin(ang))
+            ctx.move_to(cx + 6.2 * math.cos(ang), 20 + 6.2 * math.sin(ang))
+            ctx.line_to(cx + 8.4 * math.cos(ang), 20 + 8.4 * math.sin(ang))
             ctx.stroke()
-        self.media_icon(ctx, "unmute", cx, 39, 8, col)
+        self.media_icon(ctx, "unmute", cx, 39, 12, col)
         hits.append((x, 7, 52, 46, "podopen", None))
 
     POD_W = 1006  # functional pod floating on the flow (right side)
@@ -2044,37 +2056,106 @@ class Renderer:
                             self.th["darker_background"] if is_pressed else self.th["bright_foreground"])
             hits.append((bx, 9, 60, 42, "media", (name, code)))
 
+    @staticmethod
+    def batt_color(pct, charging):
+        """Traffic-light battery color: green charging or healthy,
+        amber under half, red at 20% and below."""
+        if charging or pct > 50:
+            return (0.35, 0.85, 0.45)
+        if pct <= 20:
+            return (0.95, 0.36, 0.33)
+        return (0.98, 0.76, 0.28)
+
+    def _batt_icon(self, ctx, x, cy, pct, charging):
+        """Small battery glyph: outline + level fill in batt_color,
+        lightning bolt cut in when charging. Returns icon width."""
+        col = self.batt_color(pct, charging)
+        bw, bh = 26, 13
+        y = cy - bh / 2
+        self.rr(ctx, x, y, bw, bh, 3.5)
+        ctx.set_source_rgba(*col, 0.95)
+        ctx.set_line_width(1.4)
+        ctx.stroke()
+        ctx.rectangle(x + bw + 1.5, cy - 3, 3, 6)
+        ctx.set_source_rgba(*col, 0.95)
+        ctx.fill()
+        fillw = max((bw - 4) * max(pct, 0) / 100, 2 if pct > 0 else 0)
+        if fillw:
+            self.rr(ctx, x + 2, y + 2, fillw, bh - 4, 2)
+            ctx.set_source_rgba(*col, 0.9)
+            ctx.fill()
+        if charging:
+            cx = x + bw / 2
+            # dark bolt over the colored fill; colored bolt where the
+            # fill has not reached yet (low charge would hide it)
+            if fillw >= bw / 2:
+                ctx.set_source_rgb(*self.th["darker_background"])
+            else:
+                ctx.set_source_rgba(*col, 0.95)
+            ctx.new_path()
+            ctx.move_to(cx + 1.5, cy - 5.5)
+            ctx.line_to(cx - 3.2, cy + 0.8)
+            ctx.line_to(cx - 0.4, cy + 0.8)
+            ctx.line_to(cx - 1.5, cy + 5.5)
+            ctx.line_to(cx + 3.2, cy - 0.8)
+            ctx.line_to(cx + 0.4, cy - 0.8)
+            ctx.close_path()
+            ctx.fill()
+        return bw + 5
+
     def _flow_chips(self, ctx, hits, t):
-        # status chips floating over the flow, left of the pod
+        # compact status pill, centered, hugging its content so the
+        # ASCII field stays visible around it: utilization, time,
+        # battery icon + percentage in a row (tap: drill down)
         now = time.localtime()
-        items = [time.strftime("%H:%M", now)]
-        if self.st.battery >= 0:
-            items.append(f"BATT {self.st.battery}%" + (" CHG" if self.st.charging else ""))
-        items.append(f"CPU {int(self.st.cpu * 100)}%")
+        zone_r = W - (self.POD_W + 26) if self.pod_open else W - 140
+        zx0, zx1 = RAIL_W + 12, zone_r
+        if zx1 - zx0 < 320:
+            return
         with self.st.lock:
             na = sum(1 for a in self.st.agents if a["active"])
             nt = len(self.st.agents)
+        util = f"CPU {int(self.st.cpu * 100)}%"
         if nt:
-            items.append(f"{na}/{nt} AGENTS")
-        txt = "   ".join(items) + "   >"
-        ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(17)
-        ext = ctx.text_extents(txt)
-        # the drill-downable information centerpiece: centered in the open
-        # field between the rail and the quiet right folder
-        zone_r = W - (self.POD_W + 26) if self.pod_open else W - 140
-        x = (RAIL_W + zone_r) / 2 - ext.width / 2
-        if x < RAIL_W + 12:
-            return
-        self.rr(ctx, x - 12, 10, ext.width + 24, 40, 10)
+            util += f"  {na}/{nt}"
+        tstr = time.strftime("%H:%M", now)
+        ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL,
+                             cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(15)
+        uw = ctx.text_extents(util).width
+        ctx.set_font_size(19)
+        tw = ctx.text_extents(tstr).width
+        batt_w = 0
+        pstr, col = "", None
+        if self.st.battery >= 0:
+            pstr = f"{self.st.battery}%"
+            col = self.batt_color(self.st.battery, self.st.charging)
+            ctx.set_font_size(15)
+            batt_w = 31 + 6 + ctx.text_extents(pstr).width
+        gap = 26
+        content = uw + gap + tw + (gap + batt_w if batt_w else 0)
+        pw = content + 36
+        px = (zx0 + zx1) / 2 - pw / 2
+        self.rr(ctx, px, 13, pw, 34, 9)
         ctx.set_source_rgba(*self.th["darker_background"], 0.78)
         ctx.fill()
-        self.rr(ctx, x - 12, 10, ext.width + 24, 40, 10)
+        self.rr(ctx, px, 13, pw, 34, 9)
         ctx.set_source_rgba(*self.th["muted"], 0.55)
         ctx.set_line_width(1)
         ctx.stroke()
-        self.text(ctx, txt, x, 38, 17, self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
-        hits.append((x - 12, 10, ext.width + 24, 40, "view", "fleet"))  # tap: drill down
+        x = px + 18
+        self.text(ctx, util, x, 37, 15, self.th["bright_foreground"],
+                  cairo.FONT_WEIGHT_BOLD)
+        x += uw + gap
+        self.text(ctx, tstr, x, 37, 19, self.th["bright_foreground"],
+                  cairo.FONT_WEIGHT_BOLD)
+        x += tw + gap
+        if batt_w:
+            iw = self._batt_icon(ctx, x, 30, self.st.battery,
+                                 self.st.charging)
+            self.text(ctx, pstr, x + iw + 6, 37, 15, col,
+                      cairo.FONT_WEIGHT_BOLD)
+        hits.append((px, 13, pw, 34, "view", "fleet"))
 
     # -- KEYS ---------------------------------------------------------------
     def view_keys(self, ctx, hits, t, pressed):
