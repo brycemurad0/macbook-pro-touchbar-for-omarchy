@@ -189,6 +189,121 @@
           "query"
         ]
       }
+    },
+    {
+      "name": "memory_search",
+      "type": "client",
+      "description": "PRIMARY knowledge source: semantic recall over Mnemos (curated Second Brain memory, ranked, with sources/dates). Use for project state, decisions, people, anything he asks you to recall or look up.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to recall, e.g. 'Maestro current status' or 'decision about the touchbar voice'"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "remember",
+      "type": "client",
+      "description": "Store a fact in Mnemos memory when he says 'remember that...' or tells you something worth keeping across conversations.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "fact": {
+            "type": "string",
+            "description": "The fact to store, stated plainly"
+          }
+        },
+        "required": [
+          "fact"
+        ]
+      }
+    },
+    {
+      "name": "clipboard",
+      "type": "client",
+      "description": "Copy text to this Mac's clipboard (dictation he wants to paste somewhere).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to copy"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "notify",
+      "type": "client",
+      "description": "Show a desktop notification on this Mac.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Notification text"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "remind",
+      "type": "client",
+      "description": "Set a timed desktop reminder some minutes from now.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "minutes": {
+            "type": "integer",
+            "description": "Minutes from now"
+          },
+          "text": {
+            "type": "string",
+            "description": "What to remind him about"
+          }
+        },
+        "required": [
+          "minutes",
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "media",
+      "type": "client",
+      "description": "Control media playback: status, play, pause, toggle, next, previous.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "status",
+              "play",
+              "pause",
+              "toggle",
+              "next",
+              "previous"
+            ],
+            "description": "Playback action"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
     }
   ],
   "conversation": {

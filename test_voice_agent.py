@@ -84,8 +84,40 @@ class ProfileTests(unittest.TestCase):
                                  "focus_window", "open_url", "start_work",
                                  "work_status", "fleet_sessions",
                                  "node_status", "node_shell", "daily_brief",
-                                 "brain_search"])
+                                 "brain_search", "memory_search", "remember",
+                                 "clipboard", "notify", "remind", "media"])
         self.assertEqual(set(names), set(va.EL_TOOL_FUNCS))
+
+    def test_remember_posts_to_mnemos(self):
+        import io
+        import urllib.request as u
+        seen = {}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        orig = u.urlopen
+
+        def fake(req, timeout=0):
+            seen["url"] = req.full_url
+            seen["body"] = json.loads(req.data)
+            seen["auth"] = req.headers.get("Authorization", "")
+            return Resp(b"{}")
+
+        u.urlopen = fake
+        try:
+            self.assertEqual(va.tool_remember("the sky test fact"),
+                             "remembered")
+        finally:
+            u.urlopen = orig
+        self.assertTrue(seen["url"].endswith("/store"))
+        self.assertEqual(seen["body"]["raw_text"], "the sky test fact")
+        self.assertTrue(seen["auth"].startswith("Bearer "))
+        self.assertGreater(len(seen["auth"]), 12)
 
     def test_node_resolution(self):
         self.assertIsNone(va._resolve_node("here"))

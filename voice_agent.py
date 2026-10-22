@@ -606,11 +606,25 @@ def tool_node_shell(node_query, command):
 BRAIN = os.path.expanduser("~/brain")
 
 
+def _age_note(path):
+    try:
+        import datetime
+        mtime = datetime.date.fromtimestamp(os.path.getmtime(path))
+        days = (datetime.date.today() - mtime).days
+        when = "today" if days == 0 else \
+            "yesterday" if days == 1 else f"{days} days old"
+        return f"{mtime.isoformat()} ({when})"
+    except OSError:
+        return "unknown date"
+
+
 def tool_daily_brief():
     bits = []
+    truth = os.path.join(BRAIN, "operations/CURRENT-TRUTH.md")
     try:
-        with open(os.path.join(BRAIN, "operations/CURRENT-TRUTH.md")) as f:
-            bits.append("Current truth:\n" + f.read()[:1400])
+        with open(truth) as f:
+            bits.append(f"Current truth [as of {_age_note(truth)}]:\n"
+                        + f.read()[:1400])
     except OSError:
         pass
     try:
@@ -618,8 +632,9 @@ def tool_daily_brief():
         days = sorted(glob.glob(os.path.join(BRAIN, "logs/daily/*.md")))
         if days:
             with open(days[-1]) as f:
-                bits.append(f"Latest daily log ({os.path.basename(days[-1])}):\n"
-                            + f.read()[-1600:])
+                bits.append(
+                    f"Latest daily log ({os.path.basename(days[-1])}, "
+                    f"{_age_note(days[-1])}):\n" + f.read()[-1600:])
     except OSError:
         pass
     if not bits:
@@ -633,14 +648,28 @@ def tool_brain_search(query):
     try:
         proc = subprocess.run(
             ["rg", "-i", "-n", "-m", "2", "--glob", "*.md",
-             "--glob", "!_archive/**", "--glob", "!history/**",
+             "--glob", "!**/_archive/**", "--glob", "!**/history/**",
+             "--glob", "!**/openclaw-imports/**", "--glob", "!**/legacy*/**",
              query, BRAIN], capture_output=True, text=True, timeout=12)
     except Exception as exc:
         return f"search failed: {exc}"
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
     if not lines:
-        return f"nothing in the vault about '{query}'"
-    return _truncate("\n".join(lines[:22]), 2200)
+        return f"nothing current in the vault about '{query}'"
+
+    def freshness(ln):
+        path = ln.split(":", 1)[0]
+        try:
+            return -os.path.getmtime(path)
+        except OSError:
+            return 0
+
+    lines.sort(key=freshness)  # newest notes first, legacy sinks
+    dated = []
+    for ln in lines[:22]:
+        path = ln.split(":", 1)[0]
+        dated.append(f"[{_age_note(path)}] {ln}")
+    return _truncate("\n".join(dated), 2200)
 
 
 EL_TOOL_FUNCS.update({
@@ -650,6 +679,156 @@ EL_TOOL_FUNCS.update({
                                             a.get("command", "")),
     "daily_brief": lambda a: tool_daily_brief(),
     "brain_search": lambda a: tool_brain_search(a.get("query", "")),
+})
+
+
+# ------------------------------------------------------ mnemos (memory)
+# Curated, ranked memory beats raw vault grep: the vault search surfaces
+# legacy notes as if current. Mnemos recall over the synced Second
+# Brain collection is the primary knowledge source; every result is
+# returned with its source so the model can judge freshness.
+MNEMOS_CONTAINER = "cortex/agent-context/second-brain"
+
+
+def _mnemos_url_token():
+    url = os.environ.get("MNEMOS_URL")
+    token = os.environ.get("MNEMOS_API_TOKEN")
+    try:
+        for line in open(SECRETS_ENV):
+            if line.startswith("MNEMOS_API_TOKEN="):
+                token = token or line.split("=", 1)[1].strip()
+            elif line.startswith("MNEMOS_URL="):
+                url = url or line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    if not token:
+        try:
+            with open(os.path.expanduser("~/.mnemos-harness-token")) as f:
+                token = f.read().strip() or None
+        except OSError:
+            pass
+    if not (url and token):
+        # the harness-sync unit carries the URL; reuse in-process
+        try:
+            import re
+            unit = open(os.path.expanduser(
+                "~/.config/systemd/user/mnemos-harness-sync.service")).read()
+            if not url:
+                m = re.search(r"MNEMOS_URL=(\S+)", unit)
+                url = m.group(1) if m else url
+            if not token:
+                m = re.search(r"MNEMOS_API_TOKEN=([^\s\"'$]+)", unit)
+                token = m.group(1) if m else token
+        except OSError:
+            pass
+    return (url or "http://100.127.212.28:8090").rstrip("/"), token
+
+
+def tool_memory_search(query):
+    url, token = _mnemos_url_token()
+    if not token:
+        return "mnemos token not available on this machine"
+    body = json.dumps({"query": query, "container_tag": MNEMOS_CONTAINER,
+                       "limit": 6, "rerank": True}).encode()
+    req = urllib.request.Request(
+        f"{url}/recall", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.load(resp)
+    except Exception as exc:
+        return f"mnemos recall failed: {exc}"
+    items = data if isinstance(data, list) else next(
+        (data[k] for k in ("results", "memories", "items", "data")
+         if isinstance(data.get(k), list)), [])
+    out = []
+    for it in items[:6]:
+        if not isinstance(it, dict):
+            out.append(str(it)[:300])
+            continue
+        text = next((str(it[k]) for k in
+                     ("raw_text", "text", "content", "chunk", "memory",
+                      "summary") if it.get(k)), "")
+        meta = it.get("metadata") or {}
+        src = (meta.get("relative_path") or meta.get("source")
+               or meta.get("title") or it.get("source") or "")
+        stamp = str(it.get("updated_at") or it.get("created_at")
+                    or "")[:10]
+        head = f"[{src} {stamp}]".strip()
+        out.append(f"{head} {_truncate(' '.join(text.split()), 480)}")
+    if not out:
+        return f"mnemos has nothing on '{query}'"
+    return _truncate("\n".join(out), 2400)
+
+
+EL_TOOL_FUNCS["memory_search"] = lambda a: tool_memory_search(
+    a.get("query", ""))
+
+
+def tool_remember(fact):
+    url, token = _mnemos_url_token()
+    if not token:
+        return "mnemos token not available on this machine"
+    body = json.dumps({
+        "raw_text": fact, "container_tag": MNEMOS_CONTAINER,
+        "memory_type": "episodic", "actor_id": "omarchy-voice",
+        "source_provider": "omarchy-voice"}).encode()
+    req = urllib.request.Request(
+        f"{url}/store", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            json.load(resp)
+    except Exception as exc:
+        return f"could not store memory: {exc}"
+    return "remembered"
+
+
+def tool_clipboard(text):
+    proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+    proc.communicate(text.encode(), timeout=5)
+    return f"copied {len(text)} characters to the clipboard"
+
+
+def tool_notify(text):
+    subprocess.run(["notify-send", "Omarchy Voice", text], timeout=5)
+    return "notification shown"
+
+
+def tool_remind(minutes, text):
+    try:
+        mins = max(1, int(minutes))
+    except (TypeError, ValueError):
+        return "minutes must be a number"
+    subprocess.run(["systemd-run", "--user", f"--on-active={mins}m",
+                    "--", "notify-send", "Reminder", text],
+                   capture_output=True, timeout=8, check=True)
+    return f"reminder set for {mins} minutes from now"
+
+
+def tool_media(action):
+    cmds = {"play": ["play"], "pause": ["pause"], "toggle": ["play-pause"],
+            "next": ["next"], "previous": ["previous"]}
+    if action == "status":
+        out = subprocess.run(["playerctl", "metadata", "--format",
+                              "{{artist}} - {{title}} ({{status}})"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or "nothing playing"
+    if action not in cmds:
+        return f"unknown media action '{action}'"
+    subprocess.run(["playerctl"] + cmds[action], capture_output=True,
+                   timeout=5)
+    return f"media {action}"
+
+
+EL_TOOL_FUNCS.update({
+    "remember": lambda a: tool_remember(a.get("fact", "")),
+    "clipboard": lambda a: tool_clipboard(a.get("text", "")),
+    "notify": lambda a: tool_notify(a.get("text", "")),
+    "remind": lambda a: tool_remind(a.get("minutes", 0), a.get("text", "")),
+    "media": lambda a: tool_media(a.get("action", "status")),
 })
 
 
