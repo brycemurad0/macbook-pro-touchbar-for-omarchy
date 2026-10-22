@@ -1848,11 +1848,21 @@ class Renderer:
         # per-frame easing keeps the current from micro-lurching)
         e = self._e_smooth = lerp(getattr(self, "_e_smooth", self.st.energy),
                                   self.st.energy, 0.04)
-        # field phases run on wall time, not process time: a daemon
-        # restart rejoins the same river at the same phase instead of
-        # resetting to a bare dot grid (owner-approved look, frozen).
-        # `t` (monotonic) still drives ripples/touch expiry.
-        ft = time.time()
+        # Motion is FRAME-LOCKED, not wall-clock: the phase advances
+        # one fixed step per rendered frame. Wall-time phases made
+        # every late frame (collector threads share the GIL) jump the
+        # whole field forward to "catch up" — that judder read as
+        # jitter no matter how slow the waves were. A late frame now
+        # just slows the river for a beat. Seeded from wall time so a
+        # restart rejoins at the same phase. Pace is constant: energy
+        # changes density (below), never speed — pace surges were the
+        # other half of the "spazzy" feel.
+        if getattr(self, "_flow_phase", None) is None:
+            self._flow_phase = (time.time() * 0.055) % (2 * math.pi)
+        self._flow_phase += 0.055 / 20.0
+        if self._flow_phase > 200 * math.pi:  # 0.62 * 200pi is whole turns
+            self._flow_phase -= 200 * math.pi
+        ft = self._flow_phase
         ctx.set_source_rgba(*self.th["darker_background"], 1)
         ctx.rectangle(0, 0, W, H)
         ctx.fill()
@@ -1864,8 +1874,7 @@ class Renderer:
         # the in-and-out breathing the owner hated). Kept deliberately
         # quiet: slow phases, compressed contrast, heavy easing.
         lvl = self.style.get("levels", 0.0)  # energy leverage per style
-        speed = (0.85 + 0.75 * e) * self.style.get("current", 1.0) \
-            * (1.0 + lvl * 1.1 * e)
+        speed = 1.0  # phase is in radians now (frame-locked, above)
         amp = 0.75 + 0.7 * e
         # pinwheel vortices anchored at bar thirds with a slow wander;
         # teleporting centers were a major source of visual jumping
@@ -1874,7 +1883,7 @@ class Renderer:
         spirals = [(W * 0.30, -H * 1.7, 1, 2, 0.95),
                    (W * 0.72, H * 2.7, -1, 3, 0.75)]
         _spd = self.style["spiral_spd"]
-        spiral_t = ft * (_spd[0] + _spd[1] * e)
+        spiral_t = ft * 20 * (_spd[0] + _spd[1] * e)
         self.ripples = [r for r in self.ripples if t - r[2] < 1.8]
         touch_on = bool(self.ripples) or \
             (self.touch_xy and t - self.touch_t < 2.5)
