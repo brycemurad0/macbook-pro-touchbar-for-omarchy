@@ -45,6 +45,35 @@ W, H = 2008, 60
 TOUCH_MAX_X, TOUCH_MAX_Y = 23044.0, 639.0
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy-touchbar")
 GOALS_DIR = os.path.join(STATE_DIR, "goals")
+# Quick-resume for closed SSH viewers (owner 2026-10-22): when a
+# daemon-launched remote terminal closes, its (node, harness) is kept
+# here for a while and offered as a one-tap pill in FLOW. The remote
+# harness is relaunched with its --continue flag, so the work resumes.
+RESUME_FILE = os.path.join(STATE_DIR, "closed-resumes.json")
+RESUME_TTL_S = 30 * 60
+RESUME_MAX = 3
+
+
+def _resume_load():
+    try:
+        with open(RESUME_FILE) as f:
+            entries = json.load(f)
+    except (OSError, ValueError):
+        return []
+    now = time.time()
+    return [e for e in entries if isinstance(e, dict)
+            and now - e.get("closed_at", 0) < RESUME_TTL_S][:RESUME_MAX]
+
+
+def _resume_save(entries):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = RESUME_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(entries, f)
+        os.rename(tmp, RESUME_FILE)
+    except OSError:
+        pass
 THEME_FILE = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
 FONT = "JetBrainsMono Nerd Font"
 
@@ -564,13 +593,20 @@ class State:
         self.agents = []        # {kind,glyph,label,elapsed,active,percent}
         self.dpms_on = True
         self.voice_live = False  # voice agent service state (voice.json)
+        self.dictation = "idle"  # voxtype state: idle|recording|transcribing
+        self.mic_level = 0.0     # live mic level 0..1 while dictating
+        self._mic_proc = None
+        self._mic_thread = None
         self.events = []        # completion/start events for FLOW flashes
+        self.closed_resumes = []  # recently closed ssh viewers (quick-resume)
+        self.persist_resumes = True
         self._prev_agent_map = {}
         self._pending_starts = {}
         self._prev_remote_map = {}
         self._pending_remote = {}
         self._remote_scan_running = False
         self._ssh_fail_until = {}  # alias -> monotonic deadline (backoff)
+        self._ssh_ok_until = {}  # alias -> monotonic deadline (last ssh proof)
         self._absent_local = {}
         self._absent_remote = {}
         self._prev_goal_map = {}
@@ -839,12 +875,24 @@ class State:
                 }
         return list(best.values()), attached
 
+    def _fleet_online(self, alias, ts_online):
+        """Ground truth for 'is this node up': tailscale's control-plane
+        Online flag OR a recently proven ssh scan. The flag lies in both
+        directions (Jarvis answered ssh+ping while flagged offline,
+        2026-10-22), so a node is only 'off' when both say so."""
+        return bool(ts_online) or time.monotonic() < self._ssh_ok_until.get(alias, 0)
+
     def _scan_remote_agents(self):
         """Running harness sessions on the other fleet nodes, via ssh.
-        Runs in a side thread; results land in self._remote_agents."""
+        Runs in a side thread; results land in self._remote_agents.
+        Targets are NOT gated on tailscale's Online flag (it can be
+        wrong - see _fleet_online): every ssh-able node is probed,
+        disciplined by the 6 s timeout, the side thread, and the
+        120 s failure backoff below, never a fresh login storm."""
         found = {}
         with self.lock:
-            targets = [e for e in self.nodes_detail if e.get("online") and e.get("ssh")]
+            targets = [e for e in self.nodes_detail if e.get("ssh")]
+
         now = time.monotonic()
         # backed-off nodes count as poll failures: their last-known
         # sessions are kept below, never read as "ended"
@@ -863,6 +911,7 @@ class State:
                 self._ssh_fail_until[e["ssh"]] = time.monotonic() + 120
                 continue
             self._ssh_fail_until.pop(e["ssh"], None)
+            self._ssh_ok_until[e["ssh"]] = time.monotonic() + 150
             agents, attached = self._parse_remote(e, out)
             for a in agents:
                 a["attached"] = bool(attached.get(a.get("tmux"), 0))
@@ -1038,10 +1087,11 @@ class State:
                 if host.split(".")[0].lower() in HIDE_NODES:
                     continue  # retired ghost of a live machine (fleet.json)
                 friendly = node_alias(name, host)
-                online = bool(peer.get("Online"))
+                dns_label = host.split(".")[0]
+                online = self._fleet_online(
+                    SSH_ALIASES.get(dns_label, dns_label), peer.get("Online"))
                 if online:
                     nodes.append(friendly)
-                dns_label = host.split(".")[0]
                 detail.append({"name": friendly, "host": host, "online": online,
                                "ssh": SSH_ALIASES.get(dns_label, dns_label),
                                "os": peer.get("OS", ""),
@@ -1120,6 +1170,61 @@ class State:
                 self.voice_live = (rc == 0)
             except Exception:
                 pass
+        # dictation state from voxtype's own state file (cheap read)
+        try:
+            with open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"),
+                                   "voxtype", "state")) as f:
+                self.dictation = f.read().strip() or "idle"
+        except OSError:
+            self.dictation = "idle"
+        # the dictate toggle lights up WITH the owner's voice: run a
+        # mic level monitor only while voxtype is recording
+        if self.dictation == "recording":
+            self._mic_monitor(True)
+        else:
+            self._mic_monitor(False)
+            self.mic_level *= 0.6
+
+    def _mic_monitor(self, on):
+        if on and self._mic_thread is None:
+            try:
+                proc = subprocess.Popen(
+                    ["parec", "--format=s16le", "--rate=16000", "--channels=1"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except OSError:
+                return
+            if getattr(proc, "stdout", None) is None:
+                return
+            self._mic_proc = proc
+            self._mic_thread = threading.Thread(
+                target=self._mic_read, args=(proc,), daemon=True)
+            self._mic_thread.start()
+        elif not on and self._mic_proc is not None:
+            try:
+                self._mic_proc.terminate()
+            except Exception:
+                pass
+            self._mic_proc = None
+            self._mic_thread = None
+
+    def _mic_read(self, proc):
+        import array
+        try:
+            while True:
+                buf = proc.stdout.read(3200)  # 100 ms of 16 kHz s16 mono
+                if not buf:
+                    break
+                a = array.array("h")
+                a.frombytes(buf[:len(buf) // 2 * 2])
+                if not a:
+                    continue
+                rms = math.sqrt(sum(s * s for s in a) / len(a))
+                lvl = min(1.0, rms / 900.0)
+                # fast attack, gentle release: breathes with speech
+                self.mic_level = lvl if lvl > self.mic_level \
+                    else max(lvl, self.mic_level * 0.86)
+        except Exception:
+            pass
         # cpu
         try:
             parts = [int(x) for x in open("/proc/stat").readline().split()[1:]]
@@ -1350,6 +1455,14 @@ class Actions:
             subprocess.Popen(["brightnessctl", "-d", "228600000.dsi.0", "set", f"{int(frac * 100)}%"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def toggle_dictation(self):
+        """Pod mic = push-to-talk dictation into the focused field
+        (owner 2026-10-22: NOT another realtime-agent toggle). The
+        realtime agent keeps its own FLOW switch; this talks to the
+        voxtype daemon, which types the transcript at the cursor."""
+        subprocess.Popen(["voxtype", "record", "toggle"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def toggle_voice(self, live_now):
         self.st.voice_live = not live_now
         subprocess.Popen(["systemctl", "--user", "stop" if live_now else "start",
@@ -1399,7 +1512,8 @@ class Actions:
         self.focus_client(addr)
         return True
 
-    def _open_foot(self, key, title, inner, owned=False, session=None):
+    def _open_foot(self, key, title, inner, owned=False, session=None,
+                   node_name=None):
         if self._focus_launched(key):
             return
         proc = subprocess.Popen(["foot", "--app-id=org.omarchy.dev",
@@ -1410,7 +1524,7 @@ class Actions:
         # session-name pattern: only a session we created may be
         # closed when its viewer closes.
         self._launched[key] = {"pid": proc.pid, "owned": owned,
-                               "session": session}
+                               "session": session, "node_name": node_name}
 
     def reap_closed(self):
         """When a viewer dies, close only the exact remote session
@@ -1430,6 +1544,20 @@ class Actions:
             sess = rec.get("session")
             if host == "local" or not sess:
                 continue
+            # leave a quick-resume behind in FLOW (owner 2026-10-22):
+            # closing is fine, but getting back in must be one tap.
+            entry = {"alias": host,
+                     "node_name": rec.get("node_name") or host,
+                     "harness": None if key[1] == "ssh" else key[1],
+                     "tmux": sess, "closed_at": time.time()}
+            with self.st.lock:
+                kept = [e for e in self.st.closed_resumes
+                        if not (e.get("alias") == host
+                                and e.get("harness") == entry["harness"])]
+                kept.insert(0, entry)
+                self.st.closed_resumes = kept[:RESUME_MAX]
+                if self.st.persist_resumes:
+                    _resume_save(self.st.closed_resumes)
             safe = sess.replace("'", "'\\''")
             subprocess.Popen(["ssh", "-o", "BatchMode=yes",
                               "-o", "ConnectTimeout=4", host,
@@ -1496,7 +1624,8 @@ class Actions:
         if host is not None:
             created = "tb-ssh" if harness is None else "tb-" + harness
         self._open_foot(key, title, inner,
-                        owned=host is not None, session=created)
+                        owned=host is not None, session=created,
+                        node_name=node_name)
 
     def launch_remote_resume(self, ssh_alias, node_name, harness, tmux=None):
         """Jump into a session on another machine: attach its tmux if it
@@ -1522,7 +1651,8 @@ class Actions:
         # already open in a terminal focuses it, never duplicates it
         key = (ssh_alias, harness if harness in HARNESS_CMD else "ssh")
         created = "tb-" + harness if harness in HARNESS_CMD else "tb-ssh"
-        self._open_foot(key, title, inner, owned=True, session=created)
+        self._open_foot(key, title, inner, owned=True, session=created,
+                        node_name=node_name)
 
     def focus_agent(self, pid):
         """Focus the terminal window hosting an agent process: walk the
@@ -1578,9 +1708,16 @@ FLOW_PRESETS = {
     # OWNER-FROZEN 2026-10-22: slow streaming waves, mostly dead
     # space at rest, density follows fleet agent work. Do not retune
     # without the owner watching (pinned by test_flow_owner_frozen).
+    # Owner retune 2026-10-22 (owner watching): waves read a touch
+    # too slow -> current 0.13 -> 0.16 rad/s (20 fps lockstep), and
+    # the owner ruled the current MAY quicken with fleet energy
+    # (pace_eff in view_flow, capped 1.6x). "current" is the live
+    # pace knob (phase step + glyph rate cap derive from it).
+    # RE-FROZEN same day on owner verdict: "the waves look the best
+    # now that they ever have and I want to keep it that way."
     "classic": {"ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.0,
                 "spiral_spd": (0.05, 0.08), "inten": (-0.06, 0.95),
-                "smooth": 0.08, "current": 0.13, "levels": 1.0},
+                "smooth": 0.08, "current": 0.16, "levels": 1.0},
     "drift2": {"ramp": RAMP, "fsize": 11, "spiral_w": 0.0,
                "spiral_spd": (0.12, 0.18), "inten": (0.20, 0.26),
                "smooth": 0.07, "current": 0.30},
@@ -1854,12 +1991,16 @@ class Renderer:
         # whole field forward to "catch up" — that judder read as
         # jitter no matter how slow the waves were. A late frame now
         # just slows the river for a beat. Seeded from wall time so a
-        # restart rejoins at the same phase. Pace is constant: energy
-        # changes density (below), never speed — pace surges were the
-        # other half of the "spazzy" feel.
+        # restart rejoins at the same phase. Pace was constant (energy
+        # changed density, never speed — pace surges read as "spazzy");
+        # owner overruled 2026-10-22: the current may quicken when
+        # sessions are active. It rides the per-frame-smoothed energy
+        # (0.04 easing) and caps at 1.6x base, so it swells, never lurches.
+        pace = self.style.get("current", 0.13)  # base wave pace, rad/s at 20 fps lockstep
+        pace_eff = pace * (1.0 + 0.6 * e)
         if getattr(self, "_flow_phase", None) is None:
-            self._flow_phase = (time.time() * 0.11) % (2 * math.pi)
-        self._flow_phase += 0.11 / 20.0
+            self._flow_phase = (time.time() * pace) % (2 * math.pi)
+        self._flow_phase += pace_eff / 20.0
         if self._flow_phase > 200 * math.pi:  # 0.62 * 200pi is whole turns
             self._flow_phase -= 200 * math.pi
         ft = self._flow_phase
@@ -1940,7 +2081,7 @@ class Renderer:
                     # Without this, cells hovering at a band edge
                     # flip-flop every frame — that flip-flop, not the
                     # wave drift, is what reads as jitter on the bar.
-                    step = 0.05 if touch_on else 0.006
+                    step = 0.05 if touch_on else 0.006 * pace_eff / 0.13
                     inten = prev + max(-step, min(step, inten - prev))
                 self._smooth[key] = inten
                 if inten < 0.11:
@@ -1960,10 +2101,15 @@ class Renderer:
             ctx.rectangle(W - 90 if side else 0, 0, 90, H)
             ctx.fill()
         if not background:
+            # Owner 2026-10-22: notifications never overlay the middle
+            # of FLOW. They dock left (status chips stay up); a closed
+            # ssh session's quick-resume pill docks in the same spot
+            # when no notification is live.
             if self._notif_active(t):
-                self._notify_pill(ctx, hits, t)
+                self._notify_pill(ctx, hits, t, anchor="left")
             else:
-                self._flow_chips(ctx, hits, t)
+                self._flow_resume_pill(ctx, hits)
+            self._flow_chips(ctx, hits, t)
             self._voice_switch(ctx, hits, t)
             if self.pod_open:
                 self._flow_pod(ctx, hits, t, pressed)
@@ -2080,16 +2226,28 @@ class Renderer:
         media = [("prev", "prev", KEY_PREVIOUSSONG), ("play", "play", KEY_PLAYPAUSE),
                  ("next", "next", KEY_NEXTSONG),
                  ("mute", "mute" if self.st.muted else "unmute", None),
-                 ("voice", "mic", None)]
+                 ("dictate", "mic", None)]
         for i, (name, icon, code) in enumerate(media):
             bx = sx + 4 + i * 68
             is_pressed = pressed.get(name, 0) > time.monotonic()
+            # dictation button stays lit while voxtype is listening,
+            # and breathes with the owner's voice level (owner
+            # 2026-10-22: "light up for when I'm speaking")
+            dictating = name == "dictate" and self.st.dictation == "recording"
+            busy = name == "dictate" and self.st.dictation == "transcribing"
+            hot = is_pressed or dictating or busy
+            lvl = clamp(getattr(self.st, "mic_level", 0.0)) if dictating else 0.0
             self.rr(ctx, bx, 9, 60, 42, 9)
-            ctx.set_source_rgba(*(self.th["accent"] if is_pressed else self.th["lighter_background"]),
-                                0.9 if is_pressed else 0.65)
+            ctx.set_source_rgba(*(self.th["accent"] if hot else self.th["lighter_background"]),
+                                0.30 + 0.65 * lvl if dictating else
+                                0.55 if busy else 0.9 if is_pressed else 0.65)
             ctx.fill()
+            if dictating:  # voice halo: grows/flares with speech level
+                ctx.set_source_rgba(*self.th["accent"], 0.18 + 0.45 * lvl)
+                ctx.arc(bx + 30, 30, 9 + 7 * lvl, 0, 6.29)
+                ctx.fill()
             self.media_icon(ctx, icon, bx + 30, 30, 13,
-                            self.th["darker_background"] if is_pressed else self.th["bright_foreground"])
+                            self.th["darker_background"] if hot else self.th["bright_foreground"])
             hits.append((bx, 9, 60, 42, "media", (name, code)))
         # visible fold-away button at the far right: this corner used
         # to close the pod invisibly via the field-tap catch-all
@@ -2448,26 +2606,42 @@ class Renderer:
                   self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
         hits.append((bx, by, bw, bh, kind, data))
 
+    @staticmethod
+    def _order_hosts(entries):
+        """Owner rule 2026-10-22: available hosts read left->right in
+        fleet order; offline hosts are pinned to the far right, never
+        interleaved. Stable within each group."""
+        online = [e for e in entries if e.get("online", True)]
+        offline = [e for e in entries if not e.get("online", True)]
+        return online, offline
+
     def _dev_hosts(self, ctx, hits):
         with self.st.lock:
             nodes = list(self.st.nodes_detail)
         entries = [{"name": "LOCAL", "host": None, "online": True}] + nodes
         self.text(ctx, "CHOOSE A HOST", RAIL_W + 16, 17, 11,
                   self.th["dark_foreground"], cairo.FONT_WEIGHT_BOLD)
-        n = len(entries)
-        avail = W - (RAIL_W + 16) - 12
+        online, offline = self._order_hosts(entries)
+        ordered = (online + offline)[:8]
+        online = [e for e in ordered if e.get("online", True)]
+        offline = [e for e in ordered if not e.get("online", True)]
+        n = len(ordered)
+        x0 = RAIL_W + 16
+        avail = W - x0 - 12
         cw = min(320, (avail - (n - 1) * 8) / max(n, 1))
-        for i, e in enumerate(entries[:8]):
-            bx = RAIL_W + 16 + i * (cw + 8)
-            if e.get("online", True):
-                self._dev_card(ctx, hits, bx, 22, cw, 32,
-                               e["name"][:18], "node", e, size=13)
-            else:  # offline: shown, but never a launch target
-                self.rr(ctx, bx, 22, cw, 32, 9)
-                ctx.set_source_rgba(*self.th["lighter_background"], 0.22)
-                ctx.fill()
-                self.text(ctx, e["name"][:14] + " (off)", bx + 12, 43, 12,
-                          self.th["dark_foreground"])
+        right = x0 + avail
+        for i, e in enumerate(online):
+            self._dev_card(ctx, hits, x0 + i * (cw + 8), 22, cw, 32,
+                           e["name"][:18], "node", e, size=13)
+        off_block = len(offline) * cw + max(0, len(offline) - 1) * 8
+        for j, e in enumerate(offline):
+            # offline: pinned to the right edge, shown, never a target
+            bx = right - off_block + j * (cw + 8)
+            self.rr(ctx, bx, 22, cw, 32, 9)
+            ctx.set_source_rgba(*self.th["lighter_background"], 0.22)
+            ctx.fill()
+            self.text(ctx, e["name"][:14] + " (off)", bx + 12, 43, 12,
+                      self.th["dark_foreground"])
 
     def _dev_harnesses(self, ctx, hits, node_sel, scroll):
         name = self._node_name(node_sel)
@@ -2539,10 +2713,17 @@ class Renderer:
             self.text(ctx, "NODES \u00b7 tap one to open DEV on it", x0, 17, 11,
                       self.th["dark_foreground"], cairo.FONT_WEIGHT_BOLD)
             entries = [{"name": "LOCAL", "host": None, "online": True, "os": "this mac", "ip": ""}] + nodes
-            n = len(entries)
+            online, offline = self._order_hosts(entries)
+            ordered = (online + offline)[:8]
+            online = [e for e in ordered if e.get("online", True)]
+            offline = [e for e in ordered if not e.get("online", True)]
+            n = len(ordered)
             cw = min(238, (W - x0 - 12 - (n - 1) * 8) / max(n, 1))
-            for i, e in enumerate(entries[:8]):
-                bx = x0 + i * (cw + 8)
+            right = x0 + (W - x0 - 12)
+            off_block = len(offline) * cw + max(0, len(offline) - 1) * 8
+            placed = [(x0 + i * (cw + 8), e) for i, e in enumerate(online)]
+            placed += [(right - off_block + j * (cw + 8), e) for j, e in enumerate(offline)]
+            for bx, e in placed:
                 self.rr(ctx, bx, 22, cw, 32, 8)
                 ctx.set_source_rgba(*self.th["lighter_background"], 0.55)
                 ctx.fill()
@@ -2655,8 +2836,63 @@ class Renderer:
     def _notif_active(self, t):
         return self.notification is not None and (t - self.notification["t0"]) < 12
 
-    def _notify_pill(self, ctx, hits, t):
+    def _flow_resume_pill(self, ctx, hits):
+        """One-tap way back into the most recently closed ssh session
+        (dock: left of FLOW, where left-docked notifications sit)."""
+        now = time.time()
+        with self.st.lock:
+            entries = [e for e in self.st.closed_resumes
+                       if now - e.get("closed_at", 0) < RESUME_TTL_S]
+        if not entries:
+            return
+        e = entries[0]
+        label = f"RESUME {e.get('harness') or 'ssh'}@{e.get('node_name') or e.get('alias', '')}"
+        mins = int((now - e.get("closed_at", now)) // 60)
+        if mins >= 1:
+            label += f" \u00b7 {mins}m"
+        if len(entries) > 1:
+            label += f"  +{len(entries) - 1}"
+        ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(13)
+        w = ctx.text_extents(label).width + 30
+        x, y, hh = RAIL_W + 12, 13, 34
+        self.rr(ctx, x, y, w, hh, 9)
+        ctx.set_source_rgba(*self.th["darker_background"], 0.85)
+        ctx.fill()
+        self.rr(ctx, x, y, w, hh, 9)
+        ctx.set_source_rgba(*self.th["accent"], 0.75)
+        ctx.set_line_width(1.2)
+        ctx.stroke()
+        self.text(ctx, label, x + 15, y + hh / 2 + 5, 13,
+                  self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
+        hits.append((x, y, w, hh, "resume", e))
+
+    def _notify_pill(self, ctx, hits, t, anchor="center"):
         n = self.notification
+        if anchor == "left":  # FLOW: docked left, middle stays clean
+            label = f"{n['label'][:30]} \u2014 tap to jump"
+            ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(13)
+            ext = ctx.text_extents(label)
+            w = ext.width + 50
+            x, y, hh = RAIL_W + 12, 13, 34
+            col = self.th[n["color"]]
+            self.rr(ctx, x, y, w, hh, 9)
+            ctx.set_source_rgba(*self.th["darker_background"], 0.92)
+            ctx.fill()
+            self.rr(ctx, x, y, w, hh, 9)
+            ctx.set_source_rgba(*col, 0.85)
+            ctx.set_line_width(1.4)
+            ctx.stroke()
+            pulse = 0.6 + 0.4 * math.sin(t * 5)
+            ctx.set_source_rgba(*col, pulse)
+            ctx.arc(x + 17, y + hh / 2, 4.5, 0, 6.29)
+            ctx.fill()
+            self.text(ctx, label, x + 28, y + hh / 2 + 5, 13,
+                      self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
+            self._notif_rect = (x, y, w, hh)
+            hits.append((x, y, w, hh, "notify", n))
+            return
         label = f"{n['label']} \u2014 tap to jump"
         ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         ctx.set_font_size(15)
@@ -2770,6 +3006,10 @@ class Daemon:
         self.uinput = None if snapshot_only else UInput()
         self.act = Actions(self.st, self.uinput)
         self.renderer = Renderer(self.th, self.st)
+        if snapshot_only:
+            self.st.persist_resumes = False
+        else:  # quick-resume survives daemon restarts too
+            self.st.closed_resumes = _resume_load()
         self.view = "flow"
         self.live_sel = None     # LIVE two-tap: armed selection key
         self.live_sel_at = 0.0   # ... and when it was armed (6 s expiry)
@@ -2941,7 +3181,22 @@ class Daemon:
                 self.renderer.notification = None
                 self.renderer._notif_rect = None
             return
-        if kind == "voice":
+        if kind == "resume":
+            # one tap back into a closed ssh session: relaunch its
+            # harness with --continue in a fresh remote tmux
+            self.act.launch_remote_resume(data.get("alias"),
+                                          data.get("node_name") or data.get("alias"),
+                                          data.get("harness"))
+            with self.st.lock:
+                self.st.closed_resumes = [
+                    e for e in self.st.closed_resumes
+                    if not (e.get("alias") == data.get("alias")
+                            and e.get("harness") == data.get("harness")
+                            and e.get("closed_at") == data.get("closed_at"))]
+                kept = list(self.st.closed_resumes)
+            if self.st.persist_resumes:
+                _resume_save(kept)
+        elif kind == "voice":
             self.act.toggle_voice(self.st.voice_live)
         elif kind == "notify":
             if data.get("node"):  # another machine: ssh in and resume it
@@ -2973,8 +3228,8 @@ class Daemon:
             self.pressed[name] = time.monotonic() + 0.18
             if name == "mute":
                 self.act.toggle_mute()
-            elif name == "voice":
-                self.act.toggle_voice(self.st.voice_live)
+            elif name == "dictate":
+                self.act.toggle_dictation()
             elif code:
                 self.act.key(code)
         elif kind == "win" and data:
@@ -3118,6 +3373,9 @@ class Daemon:
                 self.renderer.add_flash(color, f"{label} {suffix}".strip(),
                                         window=window, pid=pid or None,
                                         node=node, harness=harness)
+            if self.st.dictation == "recording":
+                # keep the pod (and its speaking-lit mic) on screen
+                self.pod_open_until = max(self.pod_open_until, t0 + 2)
             self.renderer.pod_open = t0 < self.pod_open_until
             if self.live_sel and t0 - self.live_sel_at > 6:
                 self.live_sel = None  # armed selection expires

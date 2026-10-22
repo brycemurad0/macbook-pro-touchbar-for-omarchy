@@ -85,6 +85,19 @@ class ReapClosed(unittest.TestCase):
                             for c in CALLS if c[0] == "ssh"), f"expected ssh tmux kill, got {CALLS}")
         self.assertEqual(d.st._remote_agents, [], "card source must be removed at once")
 
+    def test_closed_owned_terminal_leaves_quick_resume(self):
+        # Owner 2026-10-22: closing an ssh viewer is fine, but FLOW
+        # must offer a one-tap resume for it afterwards.
+        d = make_daemon()
+        d.act._launched[("node-b", "pi")] = {
+            "pid": 424242, "owned": True, "session": "tb-pi",
+            "node_name": "Node B"}
+        d.act.reap_closed()
+        self.assertEqual(len(d.st.closed_resumes), 1)
+        e = d.st.closed_resumes[0]
+        self.assertEqual((e["alias"], e["harness"], e["node_name"]),
+                         ("node-b", "pi", "Node B"))
+
     def test_closed_existing_session_is_never_killed(self):
         d = make_daemon()
         d.act._launched[("node-b", "work-session")] = {
@@ -92,6 +105,40 @@ class ReapClosed(unittest.TestCase):
         CALLS.clear()
         d.act.reap_closed()
         self.assertFalse(any(c[0] == "ssh" for c in CALLS), CALLS)
+
+class FlowResumeAndNotify(unittest.TestCase):
+    def _entry(self):
+        return {"alias": "node-b", "node_name": "Node B", "harness": "pi",
+                "tmux": "tb-pi", "closed_at": time.time()}
+
+    def test_resume_pill_docked_left_and_tap_relaunches(self):
+        d = make_daemon()
+        d.st.closed_resumes = [self._entry()]
+        hits = render(d, "flow")
+        h = find(hits, "resume")
+        self.assertIsNotNone(h, "closed ssh session must offer a resume pill")
+        self.assertLess(h[0], tb.W // 3, "resume pill docks left, never mid-field")
+        CALLS.clear()
+        tap(d, h)
+        self.assertEqual(d.st.closed_resumes, [], "resume consumes its entry")
+        self.assertTrue(any(c[0] == "foot" for c in CALLS),
+                        f"tap must relaunch a terminal, got {CALLS}")
+
+    def test_notification_docks_left_and_chips_stay(self):
+        # Owner 2026-10-22: no notification overlay in the middle of
+        # FLOW; the center status chips stay on screen.
+        d = make_daemon()
+        d.st.closed_resumes = [self._entry()]
+        d.renderer.add_flash("bright_green", "pi \u00b7 work done",
+                             node="node-b", harness="pi")
+        hits = render(d, "flow")
+        h = find(hits, "notify")
+        self.assertIsNotNone(h)
+        self.assertLess(h[0], tb.W // 3, "FLOW notification must dock left")
+        self.assertIsNotNone(find(hits, "view", "fleet"),
+                             "center status chips must stay while notifying")
+        self.assertIsNone(find(hits, "resume"),
+                          "notification takes the dock while it is live")
 
 class FlowTouch(unittest.TestCase):
     def test_ripple_answers_then_expires(self):
@@ -119,6 +166,50 @@ class DevOffline(unittest.TestCase):
         datas = [h[5].get("name") for h in hits if h[4] == "node"]
         self.assertIn("Node B", datas)
         self.assertNotIn("Atlas", datas, "offline node must not be a launch target")
+
+    def test_available_hosts_read_left_to_right_offline_last(self):
+        # Owner rule 2026-10-22: selectable hosts in fleet order from
+        # the left; offline hosts pinned right, never interleaved.
+        d = make_daemon()
+        d.st.nodes_detail = [
+            {"name": "Off A", "host": "a", "ssh": "a", "online": False, "os": "", "ip": ""},
+            {"name": "Node B", "host": "b", "ssh": "b", "online": True, "os": "", "ip": ""},
+            {"name": "Off C", "host": "c", "ssh": "c", "online": False, "os": "", "ip": ""},
+            {"name": "Node D", "host": "d", "ssh": "d", "online": True, "os": "", "ip": ""}]
+        hits = render(d, "dev")
+        nodes = sorted((h for h in hits if h[4] == "node"), key=lambda h: h[0])
+        self.assertEqual([h[5].get("name") for h in nodes],
+                         ["LOCAL", "Node B", "Node D"])
+        online, offline = tb.Renderer._order_hosts(d.st.nodes_detail)
+        self.assertEqual([e["name"] for e in online], ["Node B", "Node D"])
+        self.assertEqual([e["name"] for e in offline], ["Off A", "Off C"])
+
+class FleetOnlineTruth(unittest.TestCase):
+    def test_ssh_proof_overrides_tailscale_offline_flag(self):
+        # tailscale said Jarvis was offline while it answered ssh
+        # (2026-10-22): a fresh ssh proof must win over the flag.
+        d = make_daemon()
+        now = time.monotonic()
+        self.assertFalse(d.st._fleet_online("jarvis", False))
+        self.assertTrue(d.st._fleet_online("jarvis", True))
+        d.st._ssh_ok_until["jarvis"] = now + 150
+        self.assertTrue(d.st._fleet_online("jarvis", False))
+        d.st._ssh_ok_until["jarvis"] = now - 1  # stale proof expires
+        self.assertFalse(d.st._fleet_online("jarvis", False))
+
+    def test_remote_scan_probes_offline_flagged_nodes(self):
+        # the scan is the probe: an offline-flagged node must still be
+        # scanned (with the usual backoff), or it can never recover
+        d = make_daemon()
+        d.st.nodes_detail = [{"name": "Jarvis", "host": "jarvis",
+                              "ssh": "jarvis", "online": False,
+                              "os": "macOS", "ip": ""}]
+        seen = []
+        d.st._scan_one_node = lambda e: (seen.append(e["ssh"]) or (e, "", False))
+        d.st._scan_remote_agents()
+        self.assertEqual(seen, ["jarvis"])
+        self.assertTrue(d.st._fleet_online("jarvis", False),
+                        "a successful scan is reachability proof")
 
 class GhostNode(unittest.TestCase):
     def test_hidden_ghost_peer_never_listed(self):
@@ -169,17 +260,45 @@ class PodClose(unittest.TestCase):
                              "back button must fold the pod away")
 
 
-class PodVoice(unittest.TestCase):
-    def test_pod_has_voice_button_that_toggles(self):
+class PodDictation(unittest.TestCase):
+    def test_pod_mic_is_dictation_not_agent_toggle(self):
+        # Owner 2026-10-22: the control-pod mic is push-to-talk
+        # dictation into the focused field (voxtype), never a second
+        # realtime-voice-agent toggle (that keeps its FLOW switch).
         d = make_daemon()
         d.renderer.pod_open = True
         hits = render(d, "flow")
-        h = find(hits, "media", ("voice", None))
-        self.assertIsNotNone(h, "open pod must still offer the voice toggle")
-        CALLS.clear(); d.st.voice_live = False
+        h = find(hits, "media", ("dictate", None))
+        self.assertIsNotNone(h, "open pod must offer the dictation toggle")
+        self.assertIsNone(find(hits, "media", ("voice", None)))
+        CALLS.clear()
         tap(d, h)
-        svc = [c for c in CALLS if "omarchy-voice.service" in c]
-        self.assertTrue(svc and "start" in svc[0], f"voice button must toggle service, got {svc}")
+        vox = [c for c in CALLS if c[:3] == ["voxtype", "record", "toggle"]]
+        self.assertTrue(vox, f"mic tap must toggle voxtype, got {CALLS}")
+        self.assertFalse(any("omarchy-voice.service" in c for c in CALLS),
+                         "pod mic must not touch the realtime agent")
+
+    def test_dictate_button_brightness_follows_voice(self):
+        # Owner 2026-10-22: the toggle lights up while he is speaking
+        # (mic level -> button brightness), not a static recording lamp.
+        d = make_daemon()
+        d.renderer.pod_open = True
+        d.st.dictation = "recording"
+        def mean_brightness(lvl):
+            d.st.mic_level = lvl
+            hits = render(d, "flow")
+            h = find(hits, "media", ("dictate", None))
+            self.assertIsNotNone(h)
+            data = d.logical.get_data(); stride = d.logical.get_stride()
+            tot = cnt = 0
+            for yy in range(13, 48, 3):
+                row = yy * stride
+                for xx in range(int(h[0]) + 6, int(h[0] + h[2]) - 6, 3):
+                    o = row + xx * 4  # ARGB32 little-endian: B,G,R,A
+                    tot += data[o] + data[o + 1] + data[o + 2]; cnt += 3
+            return tot / max(cnt, 1)
+        self.assertGreater(mean_brightness(1.0), mean_brightness(0.0) + 10,
+                           "speaking loudly must visibly flare the toggle")
 
 class NotificationDismiss(unittest.TestCase):
     def test_tap_on_field_around_notification_dismisses_it(self):
@@ -301,4 +420,4 @@ class FlowFrozen(unittest.TestCase):
         self.assertEqual(tb.FLOW_PRESETS["classic"], {
             "ramp": " ·:∙~+=×*#%@", "fsize": 11, "spiral_w": 0.0,
             "spiral_spd": (0.05, 0.08), "inten": (-0.06, 0.95),
-            "smooth": 0.08, "current": 0.13, "levels": 1.0})
+            "smooth": 0.08, "current": 0.16, "levels": 1.0})

@@ -130,7 +130,9 @@ class VoiceConfigTests(unittest.TestCase):
                                  "clipboard", "notify", "remind", "media",
                                  "open_app", "close_window", "read_session",
                                  "send_to_session", "start_session",
-                                 "stop_session", "system_control"])
+                                 "stop_session", "system_control",
+                                 "files", "list_windows", "cancel_work",
+                                 "open_terminal"])
         self.assertEqual(set(names), set(vt.TOOL_FUNCS))
 
     def test_tool_schemas_are_gemini_shaped(self):
@@ -196,6 +198,51 @@ class VoiceConfigTests(unittest.TestCase):
             vt.subprocess.run, vt._fleet_cfg = orig_run, orig_cfg
         self.assertNotIn("old-macbook-pro", labels)
         self.assertIn("bob", labels)
+
+    def test_close_window_verifies_before_claiming(self):
+        # Regression (Muse probe 2026-10-22): the old tool printed
+        # "closed foot" while the window stayed open. Success may
+        # only be claimed once the address leaves j/clients.
+        win = {"address": "0xABC", "class": "foot", "title": "term", "pid": 777}
+        lists = [[win], []]  # before, then after the compositor close
+        calls = []
+        orig_hypr, orig_run = vt._hypr, vt.subprocess.run
+        vt._hypr = lambda req: json.dumps(lists.pop(0) if lists else [])
+        vt.subprocess.run = lambda a, **k: calls.append(a)
+        try:
+            out = vt.tool_close_window("foot")
+        finally:
+            vt._hypr, vt.subprocess.run = orig_hypr, orig_run
+        self.assertTrue(calls and "hl.dsp.window.close" in calls[0][-1],
+                        f"must close via compositor by address, got {calls}")
+        self.assertIn("closed foot", out)
+        # and when the window refuses to die, the tool must say so
+        vt._hypr = lambda req: json.dumps([win])
+        vt.subprocess.run = lambda a, **k: calls.append(a)
+        try:
+            out = vt.tool_close_window("foot")
+        finally:
+            vt._hypr, vt.subprocess.run = orig_hypr, orig_run
+        self.assertIn("still open", out)
+
+    def test_close_window_refuses_ambiguous_matches(self):
+        # closing the arbitrary first of several matches killed a
+        # live shell in live testing; ambiguity must be spoken back
+        wins = [{"address": "0x1", "class": "foot", "title": "a", "pid": 1},
+                {"address": "0x2", "class": "foot", "title": "b", "pid": 2}]
+        calls = []
+        orig_hypr, orig_run = vt._hypr, vt.subprocess.run
+        vt._hypr = lambda req: json.dumps(wins)
+        vt.subprocess.run = lambda a, **k: calls.append(a)
+        try:
+            out = vt.tool_close_window("foot")
+            self.assertIn("2 windows match", out)
+            self.assertFalse(calls, "ambiguous close must not dispatch anything")
+            exact = vt.tool_close_window("a")
+        finally:
+            vt._hypr, vt.subprocess.run = orig_hypr, orig_run
+        self.assertIn("still open", exact, "exact title narrows to one target")
+        self.assertTrue(calls, "exact match must dispatch the close")
 
     def test_node_resolution(self):
         self.assertIsNone(vt._resolve_node("here"))
@@ -324,3 +371,23 @@ class OsToolTests(unittest.TestCase):
     def test_open_app_no_match(self):
         self.assertIn("no app matching",
                       vt.tool_open_app("definitely-not-an-app-xyz"))
+
+
+    def test_open_terminal_builds_foot_command(self):
+        calls = []
+        lists = [[], [{"address": "0xNEW", "class": "org.omarchy.dev"}],
+                 [{"address": "0xNEW", "class": "org.omarchy.dev"}],
+                 [{"address": "0xNEW", "class": "org.omarchy.dev"},
+                  {"address": "0xNEW2", "class": "org.omarchy.dev"}]]
+        real, orig_hypr = vt.subprocess.Popen, vt._hypr
+        vt.subprocess.Popen = lambda argv, **kw: calls.append(argv)
+        vt._hypr = lambda req: json.dumps(lists.pop(0) if lists else [])
+        try:
+            out = vt.tool_open_terminal("here")
+            self.assertIn("terminal opened", out)
+            self.assertEqual(calls[0][0], "foot")
+            self.assertIn("-e", calls[0], "foot command needs -e")
+            out = vt.tool_open_terminal("here", "pi")
+            self.assertIn("pi@", out)
+        finally:
+            vt.subprocess.Popen, vt._hypr = real, orig_hypr

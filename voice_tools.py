@@ -109,10 +109,16 @@ def start_work_job(goal, harness="grok"):
               "report (at most 5 sentences): what was done and how it "
               "was verified.")
     log = open(os.path.join(JOBS_DIR, f"{jid}.log"), "wb")
+    exit_path = os.path.join(JOBS_DIR, f"{jid}.exit")
+    argv = HARNESS_CMDS.get(harness, HARNESS_CMDS["grok"]) + [prompt]
+    # wrap so the exit code survives on disk: a later daemon can
+    # then tell done from failed instead of guessing from the pid
+    wrapped = ["bash", "-c",
+               _shlex.join(argv)
+               + f"; rc=$?; echo $rc > {_shlex.quote(exit_path)}; exit $rc"]
     proc = subprocess.Popen(
-        HARNESS_CMDS.get(harness, HARNESS_CMDS["grok"]) + [prompt],
-        stdout=log, stderr=subprocess.STDOUT, cwd=os.path.expanduser("~"),
-        start_new_session=True)
+        wrapped, stdout=log, stderr=subprocess.STDOUT,
+        cwd=os.path.expanduser("~"), start_new_session=True)
     _jobs[jid] = {"proc": proc, "goal": goal, "harness": harness,
                   "log": log.name, "started": time.time()}
     reg = _load_registry()
@@ -156,7 +162,15 @@ def job_states():
         if jid in out:
             continue
         alive = _pid_alive(rec.get("pid", 0))
-        entry = {"status": "running" if alive else "done",
+        status = "running" if alive else "done"
+        if not alive:
+            try:
+                rc = int(open(os.path.join(
+                    JOBS_DIR, f"{jid}.exit")).read().strip())
+                status = "done" if rc == 0 else "failed"
+            except Exception:
+                pass
+        entry = {"status": status,
                  "goal": rec.get("goal", ""), "harness": rec.get("harness", "")}
         if not alive:
             entry["outcome"] = _job_outcome({"log": rec.get("log", "")})
@@ -188,9 +202,13 @@ def tool_work_status():
     states = job_states()
     if not states:
         return "no background jobs this session"
-    return "; ".join(
-        f"{jid} ({s['harness']}, {s['status']}): {s['goal'][:80]}"
-        for jid, s in states.items())
+    parts = []
+    for jid, s in states.items():
+        part = f"{jid} ({s['harness']}, {s['status']}): {s['goal'][:80]}"
+        if s["status"] != "running" and s.get("outcome"):
+            part += f" — result: {s['outcome'][-160:]}"
+        parts.append(part)
+    return "; ".join(parts)
 
 
 def tool_run_shell(command):
@@ -267,10 +285,14 @@ def tool_fleet_status():
         out = subprocess.run(["tailscale", "status", "--json"], capture_output=True,
                              text=True, timeout=4).stdout
         ts = json.loads(out)
+        peers = [p for p in (ts.get("Peer") or {}).values()
+                 if p.get("OS", "").lower() not in ("ios", "android")]
         up = [ts.get("Self", {}).get("HostName", "this Mac")]
-        up += [p.get("HostName") for p in (ts.get("Peer") or {}).values()
-               if p.get("Online") and p.get("OS", "").lower() not in ("ios", "android")]
+        up += [p.get("HostName") for p in peers if p.get("Online")]
+        down = [p.get("HostName") for p in peers if not p.get("Online")]
         bits.append(f"{len(up)} nodes up: {', '.join(x for x in up if x)}")
+        if down:
+            bits.append(f"offline: {', '.join(x for x in down if x)}")
     except Exception:
         pass
     try:
@@ -986,20 +1008,63 @@ def tool_open_app(query):
 
 
 def tool_close_window(query):
+    # Close through the compositor by address, then VERIFY. The old
+    # version kill()ed the client pid and reported success blind -
+    # it printed "closed foot" while the window stayed on screen
+    # (Muse probe, 2026-10-22). A close is only claimed once the
+    # address is gone from j/clients.
     try:
         clients = json.loads(_hypr("j/clients"))
     except Exception:
         return "could not read the window list"
     q = (query or "").lower()
-    for c in clients:
-        if q in (c.get("class", "") + " " + c.get("title", "")).lower():
-            pid = c.get("pid")
-            if pid:
-                subprocess.run(["kill", str(pid)], capture_output=True,
-                               timeout=5)
-                return f"closed {c.get('class')}"
-            return "found it but could not close it"
-    return f"no window matching '{query}'"
+    matches = [c for c in clients
+               if q in (c.get("class", "") + " " + c.get("title", "")).lower()]
+    if not matches:
+        return f"no window matching '{query}'"
+    if len(matches) > 1:
+        # an exact class/title hit narrows it; otherwise REFUSE -
+        # closing an arbitrary first match destroyed a live shell
+        # during live testing (2026-10-22). Ambiguity is spoken back.
+        exact = [c for c in matches
+                 if q in (c.get("class", "").lower(),
+                          (c.get("title") or "").lower())]
+        if len(exact) == 1:
+            matches = exact
+        else:
+            listing = "; ".join(
+                f"{c.get('class', '?')}: {(c.get('title') or '')[:40]}"
+                for c in matches[:5])
+            return (f"{len(matches)} windows match '{query}' - "
+                    f"be more specific. {listing}")
+    c = matches[0]
+    addr, cls = c.get("address"), c.get("class", "window")
+    if addr:
+        path = _hypr_path()
+        sig = os.path.basename(os.path.dirname(path)) if path else ""
+        env = dict(os.environ, HYPRLAND_INSTANCE_SIGNATURE=sig)
+        try:
+            subprocess.run(["hyprctl", "dispatch",
+                            f'hl.dsp.window.close({{ window = "address:{addr}" }})'],
+                           env=env, capture_output=True, timeout=5)
+        except Exception:
+            pass
+    pid = c.get("pid")
+    for attempt in range(3):
+        time.sleep(0.4 if attempt == 0 else 0.6)
+        try:
+            now = json.loads(_hypr("j/clients"))
+        except Exception:
+            break
+        if not any(x.get("address") == addr for x in now):
+            note = f" (and {len(matches) - 1} more match)" if len(matches) > 1 else ""
+            return f"closed {cls}{note}"
+        if attempt == 1 and pid:  # compositor close did not take: escalate
+            try:
+                subprocess.run(["kill", str(pid)], capture_output=True, timeout=5)
+            except Exception:
+                pass
+    return f"tried to close {cls} but it is still open"
 
 
 def tool_read_session(node_query, session, lines=30):
@@ -1128,4 +1193,186 @@ TOOL_FUNCS.update({
         a.get("node", "here"), a.get("session", "")),
     "system_control": lambda a: tool_system_control(
         a.get("action", ""), a.get("value")),
+})
+
+
+_pending_confirm = {}
+
+
+def _confirm_gate(key):
+    """Same stage-then-confirm discipline as start_work, for
+    destructive one-shot tools: first call stages, execution needs
+    a call after a new user turn."""
+    rec = _pending_confirm.get(key)
+    if rec and rec["turn"] < _user_turn and time.time() - rec["at"] < 900:
+        del _pending_confirm[key]
+        return True
+    _pending_confirm[key] = {"turn": _user_turn, "at": time.time()}
+    return False
+
+
+def tool_stop_session_gated(node_query, session):
+    name = _safe_session(session)
+    node = _resolve_node(node_query)
+    where = "here" if node is None else (
+        node["display"] if node != "unknown" else "?")
+    if not _confirm_gate(("stop_session", where, name)) \
+            and not _asked_then_answered():
+        return (f"STAGED, not stopped. Ask the user in one line: "
+                f"'Stop session {name} on {where}? It kills running "
+                "work.' Then wait for a yes in a new turn.")
+    return tool_stop_session(node_query, session)
+
+
+_SKIP_DIRS = {".cache", ".git", "node_modules", "__pycache__", ".venv"}
+
+
+def tool_files(action, path="", query=""):
+    a = (action or "list").lower()
+    home = os.path.expanduser("~")
+    try:
+        if a == "find":
+            q = (query or "").lower()
+            if not q:
+                return "find needs a name fragment"
+            hits, scanned = [], 0
+            for root, dirs, names in os.walk(home):
+                dirs[:] = [d for d in dirs if d not in _SKIP_DIRS
+                           and not d.startswith(".")]
+                for n in names:
+                    scanned += 1
+                    if q in n.lower():
+                        hits.append(os.path.join(root, n))
+                    if len(hits) >= 20 or scanned > 6000:
+                        break
+                if len(hits) >= 20 or scanned > 6000:
+                    break
+            return "; ".join(h.replace(home, "~") for h in hits) \
+                or f"no files matching '{query}'"
+        target = os.path.expanduser(path or "~")
+        if a == "list":
+            entries = sorted(os.listdir(target))
+            shown = [e + ("/" if os.path.isdir(
+                os.path.join(target, e)) else "") for e in entries[:40]]
+            return f"{target.replace(home, '~')}: " + ", ".join(shown)
+        if a == "read":
+            if os.path.getsize(target) > 2_000_000:
+                return "file too large to read aloud"
+            data = open(target, "rb").read(4000)
+            if b"\x00" in data:
+                return "that file is binary, not text"
+            return _truncate(
+                data.decode(errors="replace").strip(), 1800)
+    except Exception as exc:
+        return f"files failed: {exc}"
+    return f"unknown files action '{action}'"
+
+
+def tool_list_windows():
+    try:
+        clients = json.loads(_hypr("j/clients"))
+    except Exception:
+        return "could not read the window list"
+    lines = []
+    for c in clients:
+        ws = c.get("workspace", {}).get("id", "?")
+        lines.append(f"{c.get('class', '?')}: "
+                     f"{(c.get('title') or '')[:60]} (workspace {ws})")
+    return "; ".join(lines[:25]) or "no windows open"
+
+
+def tool_clipboard_rw(text=""):
+    if (text or "").strip():
+        return tool_clipboard(text)
+    try:
+        out = subprocess.run(["wl-paste"], capture_output=True,
+                             text=True, timeout=4)
+        return _truncate(out.stdout.strip() or "clipboard is empty", 600)
+    except Exception as exc:
+        return f"clipboard read failed: {exc}"
+
+
+def tool_cancel_work(job_id):
+    jid = (job_id or "").strip()
+    job = _jobs.get(jid)
+    if job is not None:
+        job["proc"].terminate()
+        return f"cancelling {jid}"
+    rec = _load_registry().get(jid)
+    if rec and _pid_alive(rec.get("pid", 0)):
+        try:
+            os.kill(rec["pid"], 15)
+            return f"cancelling {jid}"
+        except OSError as exc:
+            return f"could not cancel {jid}: {exc}"
+    return f"no running job '{jid}'"
+
+
+TOOL_FUNCS.update({
+    "files": lambda a: tool_files(a.get("action", "list"),
+                                  a.get("path", ""), a.get("query", "")),
+    "list_windows": lambda a: tool_list_windows(),
+    "cancel_work": lambda a: tool_cancel_work(a.get("job_id", "")),
+})
+TOOL_FUNCS["stop_session"] = lambda a: tool_stop_session_gated(
+    a.get("node", "here"), a.get("session", ""))
+TOOL_FUNCS["clipboard"] = lambda a: tool_clipboard_rw(a.get("text", ""))
+
+
+_INTERACTIVE_SHELL = {"pi": "pi", "claude": "claude", "codex": "codex",
+                      "grok": "grok", "opencode": "opencode"}
+
+
+def tool_open_terminal(node_query="here", harness="", command=""):
+    """Open a REAL terminal window on this Mac: a local shell, a
+    harness, or an ssh session into a fleet node (in tmux there, so
+    it survives drops and shows on LIVE). The tour proved open_url
+    'ssh://...' opens nothing visible — this is the proper tool."""
+    node = _resolve_node(node_query)
+    if node == "unknown":
+        return f"no fleet node matching '{node_query}'"
+    h = (harness or "").lower()
+    display = "this Mac" if node is None else node["display"]
+    title = f"{h or 'shell'}@{display}"
+    if node is None:
+        if command:
+            inner = ["bash", "-lc", command]
+        elif h in _INTERACTIVE_SHELL:
+            inner = ["bash", "-lc", _INTERACTIVE_SHELL[h]]
+        else:
+            inner = ["bash", "-l"]
+    else:
+        sess = _safe_session("tb-" + (h or "ssh"))
+        remote = f"tmux new-session -A -s {sess}"
+        if h in _INTERACTIVE_SHELL:
+            remote += f" 'bash -lic \"{_INTERACTIVE_SHELL[h]}\"'"
+        inner = ["ssh"] + SSH_OPTS + [node["ssh"], remote]
+        title += f" ({sess})"
+    # verify by NEW client address, never by title: bash retitles the
+    # window (fred@host:path) the moment its prompt draws, so a title
+    # check reports "nothing opened" while the window sits there.
+    # That mirage wasted a whole debugging loop on 2026-10-22.
+    def _addrs():
+        try:
+            return {c.get("address") for c in json.loads(_hypr("j/clients"))}
+        except Exception:
+            return set()
+    before = _addrs()
+    try:
+        subprocess.Popen(["foot", "--app-id=org.omarchy.dev",
+                          f"--title={title}", "-e"] + inner,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        return f"could not open terminal: {exc}"
+    for _ in range(6):
+        time.sleep(0.4)
+        if _addrs() - before:
+            return f"terminal opened on {display}: {title}"
+    return f"tried to open a terminal on {display} but no window appeared"
+
+
+TOOL_FUNCS.update({
+    "open_terminal": lambda a: tool_open_terminal(
+        a.get("node", "here"), a.get("harness", ""), a.get("command", "")),
 })
