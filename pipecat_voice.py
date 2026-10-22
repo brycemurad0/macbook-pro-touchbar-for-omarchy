@@ -37,9 +37,8 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
-    LLMFullResponseEndFrame,
+    LLMContextAssistantTurnFrame,
     LLMRunFrame,
-    LLMTextFrame,
     OutputAudioRawFrame,
     StartFrame,
     TranscriptionFrame,
@@ -174,14 +173,13 @@ class PwTransport(BaseTransport):
 
 
 # ------------------------------------------------------------- state/metrics
-class StateObserver(FrameProcessor):
-    """Keeps the touchbar state file + journal receipts + metrics in
-    the same shape the other voice backends produce."""
+class HeardObserver(FrameProcessor):
+    """Sits between STT and the user aggregator: transcriptions are
+    consumed by the aggregator, so receipts are logged here."""
 
     def __init__(self, metrics):
         super().__init__()
         self.metrics = metrics
-        self._assistant_text = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -190,14 +188,24 @@ class StateObserver(FrameProcessor):
             self.metrics.note_speech()
             self.metrics.user_spoke(frame.text)
             va.set_state(True, "thinking")
-        elif isinstance(frame, LLMTextFrame):
-            self._assistant_text.append(frame.text)
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            text = "".join(self._assistant_text).strip()
-            self._assistant_text = []
-            if text:
-                print("assistant:", text[:200], flush=True)
-                self.metrics.agent_replied(text)
+        await self.push_frame(frame, direction)
+
+
+class StateObserver(FrameProcessor):
+    """Keeps the touchbar state file + journal receipts + metrics in
+    the same shape the other voice backends produce. Assistant text
+    arrives aggregated as LLMContextAssistantTurnFrame."""
+
+    def __init__(self, metrics):
+        super().__init__()
+        self.metrics = metrics
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMContextAssistantTurnFrame) \
+                and frame.text.strip():
+            print("assistant:", frame.text[:200], flush=True)
+            self.metrics.agent_replied(frame.text)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self.metrics.first_audio()
             va.set_state(True, "speaking")
@@ -278,8 +286,8 @@ async def amain():
     metrics = va.ConvMetrics()
     observer = StateObserver(metrics)
     pipeline = Pipeline([
-        transport.input(), stt, aggregators.user(), llm, tts,
-        transport.output(), aggregators.assistant(), observer])
+        transport.input(), stt, HeardObserver(metrics), aggregators.user(),
+        llm, tts, transport.output(), aggregators.assistant(), observer])
     worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
     runner = WorkerRunner(handle_sigint=False)
 
@@ -311,7 +319,12 @@ async def amain():
         "role": "user",
         "content": "[The owner just toggled voice on. Open with your "
                    "greeting line, short and in character.]"})
-    await worker.queue_frames([LLMRunFrame()])
+
+    async def greet():
+        await asyncio.sleep(3)  # let the pipeline reach steady state
+        await worker.queue_frames([LLMRunFrame()])
+
+    asyncio.create_task(greet())
     print("pipecat voice up: Silero + Moonshine + Gemini + ElevenLabs",
           flush=True)
     hb = asyncio.create_task(heartbeat())
