@@ -218,6 +218,7 @@ class ConfirmGateTests(unittest.TestCase):
         vt.start_work_job = lambda goal, harness="grok": (
             self.launched.append((goal, harness)), "job-99")[1]
         vt._pending_work.update(goal=None, harness="grok", turn=-1, at=0.0)
+        vt._said.update(text="", raw="", turn=-1, at=0.0)
         vt._user_turn = 0
 
     def tearDown(self):
@@ -247,9 +248,42 @@ class ConfirmGateTests(unittest.TestCase):
         vt.TOOL_FUNCS["start_work"](args)  # stages a fresh proposal
         self.assertEqual(len(self.launched), 1)
 
+    def test_verbal_ask_then_answer_launches(self):
+        # hosted pattern: agent asked out loud, user answered, and
+        # only then does the model call start_work — first call must
+        # launch, not stage
+        vt.note_said("Count the files in your home directory. "
+                     "Want me to run that?")
+        vt.note_user_turn()
+        out = vt.TOOL_FUNCS["start_work"]({"goal": "count files",
+                                           "harness": "pi"})
+        self.assertIn("job-99 started", out)
+
+    def test_no_launch_when_ask_unanswered(self):
+        vt.note_said("Want me to run that?")
+        out = vt.TOOL_FUNCS["start_work"]({"goal": "count files"})
+        self.assertIn("STAGED", out)
+        self.assertEqual(self.launched, [])
+
     def test_different_goal_after_turn_restages(self):
         vt.TOOL_FUNCS["start_work"]({"goal": "count files"})
         vt.note_user_turn()
         out = vt.TOOL_FUNCS["start_work"]({"goal": "other job"})
         self.assertIn("STAGED", out)
         self.assertEqual(self.launched, [])
+
+
+class EchoGuardTests(unittest.TestCase):
+    def test_own_speech_is_echo(self):
+        said = "One sec. Yeah, I'm here. Where'd you want to pick up?"
+        self.assertTrue(vt.is_echo("One sec. Yeah, I'm here.", said))
+        self.assertTrue(vt.is_echo("yeah i'm here", said))
+
+    def test_user_speech_is_not_echo(self):
+        said = "One sec. Yeah, I'm here."
+        self.assertFalse(vt.is_echo("What nodes are up right now?", said))
+        self.assertFalse(vt.is_echo("Start a background job please", said))
+
+    def test_short_and_empty_never_echo(self):
+        self.assertFalse(vt.is_echo("Okay.", "Okay. Got it."))
+        self.assertFalse(vt.is_echo("anything at all", ""))

@@ -245,6 +245,42 @@ def note_user_turn():
     _user_turn += 1
 
 
+def _norm_speech(text):
+    return " ".join("".join(c if c.isalnum() or c.isspace() else " "
+                            for c in (text or "").lower()).split())
+
+
+def is_echo(heard, said):
+    """True when a transcription is just the agent's own recent speech
+    coming back through the speakers (live 2026-10-22: 'heard: One
+    sec. Yeah, I'm here' — the agent answering itself). Near-verbatim
+    containment either way; short generic phrases don't count."""
+    h, s = _norm_speech(heard), _norm_speech(said)
+    if len(h) < 8 or len(h.split()) < 2 or not s:
+        return False
+    return h in s or s in h
+
+
+_said = {"text": "", "turn": -1, "at": 0.0}
+_ASK_MARKERS = ("want me to run", "run that", "shall i run",
+                "want me to start", "go ahead and run")
+
+
+def note_said(text):
+    """Record the agent's last spoken turn so the work gate can tell
+    'already asked verbally, user just answered' (ElevenLabs-hosted
+    pattern) from 'called the tool cold' (MiniMax cascade pattern)."""
+    _said.update(text=_norm_speech(text), raw=(text or "").lower(),
+                 turn=_user_turn, at=time.time())
+
+
+def _asked_then_answered():
+    if time.time() - _said["at"] > 180 or _user_turn <= _said["turn"]:
+        return False
+    return "?" in _said.get("raw", "") and any(
+        m in _said["text"] for m in _ASK_MARKERS)
+
+
 def _start_work_tool(args):
     goal = (args.get("goal") or "").strip()
     if not goal:
@@ -253,7 +289,8 @@ def _start_work_tool(args):
     p = _pending_work
     staged = (p["goal"] or "").casefold() == goal.casefold()
     fresh = time.time() - p["at"] < 900
-    if staged and fresh and p["turn"] < _user_turn:
+    if (staged and fresh and p["turn"] < _user_turn) \
+            or _asked_then_answered():
         _pending_work["goal"] = None
         jid = start_work_job(goal, harness)
         return (f"{jid} started on {harness}. "

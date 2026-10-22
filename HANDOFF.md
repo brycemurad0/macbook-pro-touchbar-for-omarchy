@@ -321,3 +321,28 @@ Acceptance passed end-to-end. Root causes found and fixed upstream:
   file). The actual recurring crasher was voxtype.service: binary
   /usr/bin/voxtype missing, Restart=on-failure every 5s, 11,856
   restarts - disabled --now; reinstall voxtype to revive it.
+- Addendum 2026-10-22 (stack bake-off + echo/latency, Muse): owner
+  live test exposed three real faults in the cascade: (1) the mic
+  transcribed the agent's OWN speaker output ("heard: One sec. Yeah,
+  I'm here") and it answered itself; (2) MiniMax M3.1 at default
+  reasoning effort spends 1-2s / ~700 tokens thinking before the
+  first word, and sometimes returns reasoning with empty content;
+  (3) after tool calls it could go silent. Fixes: reasoning_effort
+  "low" for minimax in build_brain (probed: first content 1.9s ->
+  0.6s, zero reasoning tokens; thinking=disabled is REJECTED by the
+  model - adaptive thinking is mandatory); text echo guard
+  (voice_tools.is_echo + HeardObserver drops transcriptions that
+  near-verbatim match what the agent said in the last 10s); work
+  gate also launches when the agent already asked verbally
+  (note_said markers) and the user answered in a new turn.
+  Bake-off on the same synthetic rig: Pipecat+MiniMax-low 12/12
+  (winner, wired); ElevenLabs hosted agent (created for the test,
+  deleted after) 11/12 - fast and natural, Sarah native, natural
+  verbal confirm, BUT deadlocked on the old gate (fixed since),
+  transcribed mic silence as "..." and nagged "Still there?",
+  per-minute pricing, brain is EL-side Gemini 2.5 Flash; Gemini
+  Live direct SDK calls tools in 0.7s but via Pipecat the session
+  dies (1008 aborted) - not viable today; Gemini cascade quota
+  429 all day; OpenAI Realtime / xAI voice have no keys here;
+  local speech-to-speech (Moshi/Ultravox on the DGX) untested -
+  heavy, and loses the ElevenLabs Sarah voice. Suite 39/39.

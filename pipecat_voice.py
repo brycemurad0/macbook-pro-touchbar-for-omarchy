@@ -246,6 +246,11 @@ class HeardObserver(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            said = self.health.get("said_text", "")
+            if time.time() - self.health.get("said_at", 0) < 10 \
+                    and vt.is_echo(frame.text, said):
+                print("echo dropped:", frame.text[:120], flush=True)
+                return
             print("heard:", frame.text[:200], flush=True)
             vt.note_user_turn()
             self.metrics.note_speech()
@@ -291,6 +296,9 @@ class StateObserver(FrameProcessor):
         if isinstance(frame, LLMContextAssistantTurnFrame) \
                 and frame.text.strip():
             print("assistant:", frame.text[:200], flush=True)
+            self.health["said_text"] = frame.text
+            self.health["said_at"] = time.time()
+            vt.note_said(frame.text)
             self.metrics.agent_replied(frame.text)
             self.health["awaiting"] = False
             self.health["retries"] = 0
@@ -412,6 +420,15 @@ def build_brain(cfg, system):
                 kw = {"api_key": key, "model": model,
                       "params": OpenAILLMService.InputParams(
                           temperature=0.7)}
+                if provider == "minimax":
+                    # M3.1 is a reasoning model: at default effort it
+                    # burns ~1-2s and hundreds of tokens thinking before
+                    # the first spoken word (and sometimes returns the
+                    # reasoning with empty content). Low effort: first
+                    # content ~0.6s, no reasoning tokens. Probed live.
+                    kw["params"] = OpenAILLMService.InputParams(
+                        temperature=0.7,
+                        extra={"extra_body": {"reasoning_effort": "low"}})
                 if provider == "openrouter":
                     kw["base_url"] = "https://openrouter.ai/api/v1"
                 elif provider == "minimax":
