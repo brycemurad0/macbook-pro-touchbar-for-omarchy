@@ -721,7 +721,7 @@ def _mnemos_url_token():
                 token = m.group(1) if m else token
         except OSError:
             pass
-    return (url or "http://100.127.212.28:8090").rstrip("/"), token
+    return (url or "http://127.0.0.1:8090").rstrip("/"), token
 
 
 def tool_memory_search(query):
