@@ -1858,8 +1858,8 @@ class Renderer:
         # changes density (below), never speed — pace surges were the
         # other half of the "spazzy" feel.
         if getattr(self, "_flow_phase", None) is None:
-            self._flow_phase = (time.time() * 0.055) % (2 * math.pi)
-        self._flow_phase += 0.055 / 20.0
+            self._flow_phase = (time.time() * 0.11) % (2 * math.pi)
+        self._flow_phase += 0.11 / 20.0
         if self._flow_phase > 200 * math.pi:  # 0.62 * 200pi is whole turns
             self._flow_phase -= 200 * math.pi
         ft = self._flow_phase
