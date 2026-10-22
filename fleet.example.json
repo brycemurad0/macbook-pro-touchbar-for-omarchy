@@ -1,0 +1,8 @@
+{
+  "node_aliases": {
+    "dns-label": "Display Name"
+  },
+  "ssh_aliases": {
+    "dns-label": "ssh-config-host"
+  }
+}

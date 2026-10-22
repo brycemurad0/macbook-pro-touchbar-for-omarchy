@@ -1,0 +1,13 @@
+[Unit]
+Description=Omarchy Touch Bar (FLOW / KEYS / CTRL / LIVE / DEV)
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.config/omarchy/touchbar/touchbar.py
+Restart=always
+RestartSec=2
+Nice=10
+CPUWeight=25
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,5 @@
+{
+  "provider": "grok",
+  "model": "grok-voice-latest",
+  "voice": "ara"
+}
