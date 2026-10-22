@@ -3,8 +3,8 @@
   "llm": "gemini-2.5-flash",
   "llm_note": "Latest Gemini Flash available on ElevenLabs at apply time; apply_agent.py falls back to the newest gemini-*-flash the account offers. Voice-layer only: conversation + tool decisions. Real work runs on stronger harness models.",
   "temperature": 0.7,
-  "tts_model": "eleven_flash_v2_5",
-  "voice_name": "Rachel",
+  "tts_model": "eleven_flash_v2",
+  "voice_name": "Roger",
   "voice_settings": {
     "stability": 0.45,
     "similarity_boost": 0.8,
@@ -36,7 +36,8 @@
         "type": "object",
         "properties": {
           "command": {
-            "type": "string"
+            "type": "string",
+            "description": "The bash command to run (short and bounded)"
           }
         },
         "required": [
@@ -52,7 +53,8 @@
         "type": "object",
         "properties": {
           "query": {
-            "type": "string"
+            "type": "string",
+            "description": "App name or window title fragment, e.g. 'chrome' or 'terminal'"
           }
         },
         "required": [
@@ -68,7 +70,8 @@
         "type": "object",
         "properties": {
           "url": {
-            "type": "string"
+            "type": "string",
+            "description": "The full URL to open"
           }
         },
         "required": [
@@ -111,6 +114,80 @@
       "parameters": {
         "type": "object",
         "properties": {}
+      }
+    },
+    {
+      "name": "fleet_sessions",
+      "type": "client",
+      "description": "THE answer to 'what's running on my fleet': live agent sessions (tmux + harness kind) on every node, scanned in real time. Use for any question about work happening across the network.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "node_status",
+      "type": "client",
+      "description": "Deep status of one fleet node: uptime/load, disk, top CPU processes, tmux sessions.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "node": {
+            "type": "string",
+            "description": "Node name, e.g. 'bob', 'sparky', 'pavilion', or 'here' for this Mac"
+          }
+        },
+        "required": [
+          "node"
+        ]
+      }
+    },
+    {
+      "name": "node_shell",
+      "type": "client",
+      "description": "Run a short bounded command (max ~25 seconds) on any fleet node via ssh, for quick checks or small actions across the network. Not for heavy work - that goes through start_work.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "node": {
+            "type": "string",
+            "description": "Node name, e.g. 'bob' or 'sparky'"
+          },
+          "command": {
+            "type": "string",
+            "description": "The command to run on that node"
+          }
+        },
+        "required": [
+          "node",
+          "command"
+        ]
+      }
+    },
+    {
+      "name": "daily_brief",
+      "type": "client",
+      "description": "The fleet's current truth and latest daily captain's log from the Second Brain vault: priorities, project state, what happened today. Use first for project/status questions.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "brain_search",
+      "type": "client",
+      "description": "Search the Second Brain vault notes for a project, decision, or topic (e.g. 'Treadle', 'Maestro'). Use for specifics after daily_brief.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Project name or topic to search for"
+          }
+        },
+        "required": [
+          "query"
+        ]
       }
     }
   ],

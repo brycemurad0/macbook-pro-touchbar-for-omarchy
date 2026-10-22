@@ -53,6 +53,24 @@ class JobTests(unittest.TestCase):
                          "no goal given")
 
 
+class MetricsTests(unittest.TestCase):
+    def test_summary_math(self):
+        m = va.ConvMetrics()
+        m.user_spoke("what is the battery status")
+        m.first_audio()
+        m.agent_replied("Eighty percent.")
+        m.interruptions += 1
+        s = m.summary()
+        self.assertEqual(s["user_turns"], 1)
+        self.assertEqual(s["user_words"], 5)
+        self.assertEqual(s["agent_chars"], 15)
+        self.assertEqual(s["interruptions"], 1)
+        self.assertIsNotNone(s["latency_p50"])
+        self.assertEqual(m.latencies, m.latencies[:1])
+        m.first_audio()  # no pending user event: no double count
+        self.assertEqual(len(m.latencies), 1)
+
+
 class ProfileTests(unittest.TestCase):
     def test_profile_shape_and_persona_rules(self):
         profile = json.load(open(os.path.join(BASE, "agent-profile.json")))
@@ -64,8 +82,17 @@ class ProfileTests(unittest.TestCase):
         names = [t["name"] for t in profile["tools"]]
         self.assertEqual(names, ["fleet_status", "run_shell",
                                  "focus_window", "open_url", "start_work",
-                                 "work_status"])
+                                 "work_status", "fleet_sessions",
+                                 "node_status", "node_shell", "daily_brief",
+                                 "brain_search"])
         self.assertEqual(set(names), set(va.EL_TOOL_FUNCS))
+
+    def test_node_resolution(self):
+        self.assertIsNone(va._resolve_node("here"))
+        self.assertIsNone(va._resolve_node(""))
+        self.assertEqual(va._resolve_node("no-such-node-xyz"), "unknown")
+        node = va._resolve_node("bob")
+        self.assertIn(node["display"].lower(), ("bob",))
 
 
 if __name__ == "__main__":

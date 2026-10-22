@@ -417,6 +417,242 @@ EL_TOOL_FUNCS = {
 }
 
 
+# --------------------------------------------- fleet senses (voice tools)
+# The voice agent must understand the fleet, not just itself: what agent
+# sessions are actually running where, what state each node is in, what
+# the Second Brain says about projects, and what happened today.
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPath=" + os.path.expanduser("~/.ssh/cm-%C"),
+            "-o", "ControlPersist=180"]
+HARNESS_WORDS = ("hermes", "grok", "claude", "codex", "opencode", "pi",
+                 "cursor", "kimi", "antigravity", "mcode")
+
+
+def _fleet_cfg():
+    try:
+        with open(os.path.join(BASE_DIR, "fleet.json")) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fleet_nodes():
+    """[{label, display, ssh|None(local), online}] from tailscale."""
+    cfg = _fleet_cfg()
+    aliases = cfg.get("node_aliases") or {}
+    ssh_aliases = cfg.get("ssh_aliases") or {}
+    nodes = []
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"],
+                             capture_output=True, text=True, timeout=5).stdout
+        ts = json.loads(out)
+    except Exception:
+        return nodes
+    entries = [(ts.get("Self") or {}, True)]
+    entries += [(p, False) for p in (ts.get("Peer") or {}).values()]
+    for peer, is_self in entries:
+        if (peer.get("OS", "").lower() in ("ios", "android")):
+            continue
+        dns = (peer.get("DNSName") or "").rstrip(".")
+        label = dns.split(".")[0].lower() if dns else \
+            (peer.get("HostName") or "").lower()
+        if not label:
+            continue
+        nodes.append({
+            "label": label,
+            "display": aliases.get(label, peer.get("HostName") or label),
+            "ssh": None if is_self else (ssh_aliases.get(label) or label),
+            "online": bool(peer.get("Online")) or is_self,
+            "self": is_self})
+    return nodes
+
+
+def _resolve_node(query):
+    q = (query or "").strip().lower()
+    if not q or q in ("here", "local", "this", "fred", os.uname().nodename):
+        return None  # local
+    for n in _fleet_nodes():
+        if q in (n["label"], n["display"].lower(),
+                 (n["ssh"] or "").lower()):
+            return n
+    for n in _fleet_nodes():
+        if q in n["label"] or q in n["display"].lower():
+            return n
+    return "unknown"
+
+
+def _run_on(node, command, timeout=10):
+    """node None = local shell; else multiplexed ssh (shared with the
+    touchbar's connections, so no fresh-login storms)."""
+    if node is None:
+        proc = subprocess.run(["bash", "-lc", command], capture_output=True,
+                              text=True, timeout=timeout,
+                              cwd=os.path.expanduser("~"))
+    else:
+        proc = subprocess.run(["ssh"] + SSH_OPTS + [node["ssh"], command],
+                              capture_output=True, text=True, timeout=timeout)
+    return (proc.stdout + proc.stderr).strip()
+
+
+def _sessions_on(node):
+    """[{'name': tmux session, 'kind': harness}] for one node."""
+    out = _run_on(node,
+                  "ps -eo pid=,ppid=,args=; echo __S__; "
+                  "tmux list-sessions -F '#{session_name}' 2>/dev/null; "
+                  "echo __P__; "
+                  "tmux list-panes -a -F '#{pane_pid} #{session_name}' "
+                  "2>/dev/null", timeout=8)
+    # exact-line markers: the scan's own cmdline in ps output contains
+    # the marker text but never as a whole line by itself
+    lines = out.splitlines()
+    try:
+        i_s = lines.index("__S__")
+        i_p = lines.index("__P__")
+    except ValueError:
+        return []
+    ps_part = "\n".join(lines[:i_s])
+    sess_part = "\n".join(lines[i_s + 1:i_p])
+    pane_part = "\n".join(lines[i_p + 1:])
+    sessions = [ln.strip() for ln in sess_part.splitlines() if ln.strip()]
+    if not sessions:
+        return []
+    pane_sess = {}
+    for ln in pane_part.splitlines():
+        p = ln.split(None, 1)
+        if len(p) == 2 and p[0].isdigit():
+            pane_sess[int(p[0])] = p[1]
+    procs, children = {}, {}
+    for ln in ps_part.splitlines():
+        p = ln.split(None, 2)
+        if len(p) == 3 and p[0].isdigit():
+            procs[int(p[0])] = p[2]
+            children.setdefault(int(p[1]), []).append(int(p[0]))
+
+    def kind_of(root):
+        stack, seen = [root], set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            args = procs.get(pid, "").lower()
+            for w in HARNESS_WORDS:
+                if w in args:
+                    return w
+            stack.extend(children.get(pid, []))
+        return "shell"
+
+    by_sess = {}
+    for pid, sess in pane_sess.items():
+        by_sess.setdefault(sess, kind_of(pid))
+    return [{"name": s, "kind": by_sess.get(s, "shell")} for s in sessions]
+
+
+def tool_fleet_sessions():
+    from concurrent.futures import ThreadPoolExecutor
+    nodes = _fleet_nodes()
+    if not nodes:
+        return "could not read the fleet (tailscale status failed)"
+
+    def describe(node):
+        if not node["online"]:
+            return f"{node['display']}: offline"
+        try:
+            sess = _sessions_on(None if node["self"] else node)
+        except Exception:
+            return f"{node['display']}: unreachable"
+        if not sess:
+            return f"{node['display']}: no agent sessions"
+        inner = ", ".join(f"{s['name']} ({s['kind']})" for s in sess)
+        return f"{node['display']}: {inner}"
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return ". ".join(ex.map(describe, nodes))
+
+
+def tool_node_status(node_query):
+    node = _resolve_node(node_query)
+    if node == "unknown":
+        return f"no fleet node matching '{node_query}'"
+    try:
+        out = _run_on(node,
+                      "uptime | sed 's/^ *//'; df -h / | tail -1 | "
+                      "awk '{print \"disk \" $5 \" used\"}'; "
+                      "ps -eo pcpu=,comm= | sort -rn | head -3 | "
+                      "awk '{printf \"%s %s%% cpu; \", $2, $1}'; echo; "
+                      "tmux list-sessions -F '#{session_name}' 2>/dev/null "
+                      "| paste -sd, -", timeout=10)
+    except Exception as exc:
+        return f"could not reach {node_query}: {exc}"
+    name = "this Mac" if node is None else node["display"]
+    return _truncate(f"{name}: {out}", 900)
+
+
+def tool_node_shell(node_query, command):
+    node = _resolve_node(node_query)
+    if node == "unknown":
+        return f"no fleet node matching '{node_query}'"
+    try:
+        out = _run_on(node, command, timeout=25)
+    except subprocess.TimeoutExpired:
+        return "command timed out after 25 seconds (use start_work for longer work)"
+    except Exception as exc:
+        return f"command failed to run: {exc}"
+    return _truncate(out or "(no output)", 1200)
+
+
+BRAIN = os.path.expanduser("~/brain")
+
+
+def tool_daily_brief():
+    bits = []
+    try:
+        with open(os.path.join(BRAIN, "operations/CURRENT-TRUTH.md")) as f:
+            bits.append("Current truth:\n" + f.read()[:1400])
+    except OSError:
+        pass
+    try:
+        import glob
+        days = sorted(glob.glob(os.path.join(BRAIN, "logs/daily/*.md")))
+        if days:
+            with open(days[-1]) as f:
+                bits.append(f"Latest daily log ({os.path.basename(days[-1])}):\n"
+                            + f.read()[-1600:])
+    except OSError:
+        pass
+    if not bits:
+        return "no Second Brain vault found on this machine"
+    return _truncate("\n\n".join(bits), 3200)
+
+
+def tool_brain_search(query):
+    if not os.path.isdir(BRAIN):
+        return "no Second Brain vault found on this machine"
+    try:
+        proc = subprocess.run(
+            ["rg", "-i", "-n", "-m", "2", "--glob", "*.md",
+             "--glob", "!_archive/**", "--glob", "!history/**",
+             query, BRAIN], capture_output=True, text=True, timeout=12)
+    except Exception as exc:
+        return f"search failed: {exc}"
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return f"nothing in the vault about '{query}'"
+    return _truncate("\n".join(lines[:22]), 2200)
+
+
+EL_TOOL_FUNCS.update({
+    "fleet_sessions": lambda a: tool_fleet_sessions(),
+    "node_status": lambda a: tool_node_status(a.get("node", "")),
+    "node_shell": lambda a: tool_node_shell(a.get("node", ""),
+                                            a.get("command", "")),
+    "daily_brief": lambda a: tool_daily_brief(),
+    "brain_search": lambda a: tool_brain_search(a.get("query", "")),
+})
+
+
 def resolve_elevenlabs_key():
     if os.environ.get("ELEVENLABS_API_KEY"):
         return os.environ["ELEVENLABS_API_KEY"]
@@ -695,6 +931,64 @@ class VoiceSession:
 
 # ------------------------------------------------------------- elevenlabs
 EL_RATE = 16000
+METRICS_PATH = os.path.expanduser(
+    "~/.local/state/omarchy-touchbar/voice-metrics.jsonl")
+
+
+class ConvMetrics:
+    """Per-conversation numbers that size a future self-hosted pipeline:
+    how much the agent actually talks (TTS chars -> wiring-C cost), how
+    fast it answers after the user stops, how often the user barges in
+    (the turn-taking bar a local VAD must match), and how long sessions
+    run (minutes/month -> wiring-B cost). Numeric only, local only."""
+
+    def __init__(self):
+        self.started = time.time()
+        self.user_turns = 0
+        self.user_words = 0
+        self.agent_chars = 0
+        self.agent_turns = 0
+        self.interruptions = 0
+        self.tool_calls = 0
+        self.latencies = []
+        self._last_user_event = 0.0
+
+    def user_spoke(self, transcript):
+        self.user_turns += 1
+        self.user_words += len((transcript or "").split())
+        self._last_user_event = time.time()
+
+    def first_audio(self):
+        if self._last_user_event:
+            self.latencies.append(time.time() - self._last_user_event)
+            self._last_user_event = 0.0
+
+    def agent_replied(self, text):
+        self.agent_turns += 1
+        self.agent_chars += len(text or "")
+
+    def summary(self):
+        lat = sorted(self.latencies)
+        return {
+            "ts": self.started,
+            "seconds": round(time.time() - self.started),
+            "user_turns": self.user_turns,
+            "user_words": self.user_words,
+            "agent_turns": self.agent_turns,
+            "agent_chars": self.agent_chars,
+            "interruptions": self.interruptions,
+            "tool_calls": self.tool_calls,
+            "latency_p50": round(lat[len(lat) // 2], 2) if lat else None,
+            "latency_max": round(lat[-1], 2) if lat else None,
+        }
+
+    def flush(self):
+        try:
+            os.makedirs(os.path.dirname(METRICS_PATH), exist_ok=True)
+            with open(METRICS_PATH, "a") as f:
+                f.write(json.dumps(self.summary()) + "\n")
+        except OSError:
+            pass
 
 
 class ElevenLabsSession:
@@ -716,6 +1010,7 @@ class ElevenLabsSession:
         self._last_audio = 0.0
         self._out_rate = EL_RATE
         self._announcer_live = False
+        self.metrics = ConvMetrics()
 
     def _st(self, status):
         self.status = status
@@ -784,6 +1079,7 @@ class ElevenLabsSession:
         name = call.get("tool_name", "")
         call_id = call.get("tool_call_id", "")
         args = call.get("parameters") or {}
+        self.metrics.tool_calls += 1
         print(f"tool call: {name} {str(args)[:120]}", flush=True)
         self._st(f"tool: {name}")
         func = EL_TOOL_FUNCS.get(name)
@@ -816,6 +1112,7 @@ class ElevenLabsSession:
                 audio = (ev.get("audio_event") or {}).get("audio_base_64", "")
                 if not audio:
                     continue
+                self.metrics.first_audio()
                 self._last_audio = time.time()
                 if self.player is None or self.player.poll() is not None:
                     self._start_player()
@@ -826,14 +1123,17 @@ class ElevenLabsSession:
                     print(f"player write failed: {exc}", flush=True)
                     self._start_player()
             elif t == "agent_response":
-                print("assistant:", ((ev.get("agent_response_event") or {})
-                                     .get("agent_response") or "")[:200],
-                      flush=True)
+                text = ((ev.get("agent_response_event") or {})
+                        .get("agent_response") or "")
+                self.metrics.agent_replied(text)
+                print("assistant:", text[:200], flush=True)
             elif t == "user_transcript":
-                print("heard:", ((ev.get("user_transcription_event") or {})
-                                 .get("user_transcript") or "")[:200],
-                      flush=True)
+                text = ((ev.get("user_transcription_event") or {})
+                        .get("user_transcript") or "")
+                self.metrics.user_spoke(text)
+                print("heard:", text[:200], flush=True)
             elif t == "interruption":
+                self.metrics.interruptions += 1
                 self._flush_player()
             elif t == "ping":
                 event_id = (ev.get("ping_event") or {}).get("event_id")
@@ -901,6 +1201,7 @@ class ElevenLabsSession:
                 url = await asyncio.to_thread(self._signed_url, key, agent_id)
                 async with websockets.connect(url, open_timeout=15) as ws:
                     self.ws = ws
+                    self.metrics = ConvMetrics()
                     delay = 3
                     print("connected to elevenlabs voice", flush=True)
                     import datetime
@@ -918,6 +1219,7 @@ class ElevenLabsSession:
             except Exception as exc:
                 print(f"elevenlabs session dropped ({exc}); reconnecting",
                       flush=True)
+                self.metrics.flush()
                 self._announcer_live = False
                 self._stop_player()
                 if not self.closed:
@@ -946,6 +1248,8 @@ async def _amain():
     finally:
         session.closed = True
         session._stop_player()
+        if hasattr(session, "metrics"):
+            session.metrics.flush()
 
 
 def main():
