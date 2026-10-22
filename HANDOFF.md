@@ -346,3 +346,22 @@ Acceptance passed end-to-end. Root causes found and fixed upstream:
   429 all day; OpenAI Realtime / xAI voice have no keys here;
   local speech-to-speech (Moshi/Ultravox on the DGX) untested -
   heavy, and loses the ElevenLabs Sarah voice. Suite 39/39.
+- Addendum 2026-10-22 (dialogue purity, config-side; Muse): owner
+  live test heard tool preambles ("Let me check the fleet..."),
+  filler, and cut-offs mixed with real answers. A DialogueGate
+  frame processor (buffer LLM text, drop pre-tool text) was built
+  and passed 12/12 but never fired on the rig, and the owner
+  explicitly preferred config over injected dialogue machinery -
+  REMOVED. Shipped instead: (1) voice.json hard rule "Never speak
+  before or between tool calls... your first spoken words are the
+  result" - rig run shows zero narration in every assistant frame,
+  12/12; (2) thinking is config, not code: MiniMax reasoning_effort
+  "low" (reasoning_content is a separate API field and is never
+  voiced by the adapter anyway); (3) audio-side only: mic duck
+  0.15 -> 0.04 while she speaks (her own voice was passing VAD and
+  cutting herself off) and the echo-guard clock now starts at
+  BotStoppedSpeaking with a 20s window (speaker/room latency meant
+  echo arrived ~12s after the text frame). If preambles return in
+  live use, the gate is the fallback - it is in git history
+  (built and removed 2026-10-22, never committed; rebuild from
+  this description).

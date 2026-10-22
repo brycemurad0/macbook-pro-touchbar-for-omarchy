@@ -119,7 +119,11 @@ class PwInputTransport(BaseInputTransport):
             if not data:
                 break
             if self._duck.ducking:
-                data = vt._gain_pcm(data, 0.15)
+                # near-mute, not a polite duck: at 0.15 the agent's
+                # own voice still passed VAD and interrupted itself
+                # mid-sentence (live 2026-10-22). Turns are short;
+                # barge-in resumes 0.7s after she stops.
+                data = vt._gain_pcm(data, 0.04)
             else:
                 data = vt._gain_pcm(data, 2.0)
             await self.push_audio_frame(InputAudioRawFrame(
@@ -247,7 +251,7 @@ class HeardObserver(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             said = self.health.get("said_text", "")
-            if time.time() - self.health.get("said_at", 0) < 10 \
+            if time.time() - self.health.get("said_at", 0) < 20 \
                     and vt.is_echo(frame.text, said):
                 print("echo dropped:", frame.text[:120], flush=True)
                 return
@@ -307,6 +311,10 @@ class StateObserver(FrameProcessor):
             self.metrics.first_audio()
             vt.set_state(True, "speaking")
         elif isinstance(frame, BotStoppedSpeakingFrame):
+            # echo of this speech reaches the mic only now (speaker
+            # + room latency), so the echo-guard clock starts here,
+            # not when the text was generated
+            self.health["said_at"] = time.time()
             vt.set_state(True, "listening")
         elif isinstance(frame, ErrorFrame):
             text = str(frame.error)
