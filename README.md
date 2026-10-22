@@ -28,20 +28,37 @@ jumps to its session; tapping the ASCII field around it dismisses it.
 
 ## Voice (optional)
 
-`voice_agent.py` is a live voice agent client. Default backend is
-ElevenLabs Conversational AI (ASR → LLM → TTS pipeline): persona,
+`voice_agent.py` is a live voice agent client. ElevenLabs
+Conversational AI provides ears, turn-taking, and mouth; the persona,
 voice, and brain are versioned in `agent-profile.example.json` and
 applied with `apply_agent.py`; the daemon keeps PipeWire mic/speaker
 I/O and executes the agent's client tools locally — quick checks
-(fleet status, shell, window focus, URL open) answer by voice, while
-real work is restated as a goal, confirmed out loud, then run
+(fleet sessions/status, Mnemos memory recall, shell here or on any
+node, window focus, clipboard, reminders, media) answer by voice,
+while real work is restated as a goal, confirmed out loud, then run
 permissionless in the background by a coding harness (`start_work`)
-and reported once when done. Put `ELEVENLABS_API_KEY` in
-`~/.config/omarchy/touchbar/voice-secrets.env`, run
-`python3 apply_agent.py`, copy `voice-config.example.json` to
-`~/.config/omarchy/touchbar/voice-config.json`. Toggle it from FLOW.
-xAI Grok Voice (native speech-to-speech) remains available as
-`provider: grok`.
+and reported once when done. Toggle it from FLOW.
+
+The brain has two wirings, chosen by `brain` in `voice-config.json`:
+
+- `hosted` — ElevenLabs serves the model from their menu
+  (`gemini-3.8-flash` by default). Zero local moving parts.
+- `custom` (wiring B) — `llm_bridge.py` serves `gemini-3.8-flash`
+  from your own Gemini API key in OpenAI-compatible form, exposed to
+  ElevenLabs over Tailscale Funnel behind a generated shared secret;
+  ElevenLabs calls it as a custom LLM. `apply_agent.py` only switches
+  the agent to the bridge when the bridge is up *and* has a key, so
+  the agent can never be stranded on a dead endpoint.
+
+Setup: put `ELEVENLABS_API_KEY` (and `GEMINI_API_KEY` for the custom
+brain) in `~/.config/omarchy/touchbar/voice-secrets.env` (mode 600,
+never committed), copy the two `*.example.json` config files into
+place, and run `python3 apply_agent.py`. xAI Grok Voice (native
+speech-to-speech) remains available as `provider: grok`. Every
+conversation appends one numeric metrics row (length, turns, agent
+characters, answer latency, interruptions, tool calls) to
+`~/.local/state/omarchy-touchbar/voice-metrics.jsonl` — the data that
+will justify (or kill) a future fully-local pipeline.
 
 ## Install
 
@@ -69,6 +86,20 @@ State and diagnostics live in `~/.local/state/omarchy-touchbar/`
 (`stats.json` frame timings, `preview.png` periodic render). At 20 fps
 the daemon should show `fps == upload_fps`.
 
+## Configuration
+
+Everything machine-specific or preferential is config, never code:
+
+| File (in `~/.config/omarchy/touchbar/`) | Controls |
+|---|---|
+| `fleet.json` | Display names + ssh aliases per Tailscale node (see `fleet.example.json`) |
+| `voice-config.json` | Voice provider (`elevenlabs`/`grok`), `agent_id`, brain wiring (`hosted`/`custom`) |
+| `agent-profile.json` | Persona prompt, voice name + settings, brain model, tool list, turn patience (applied by `apply_agent.py`) |
+| `voice-secrets.env` | API keys only (`ELEVENLABS_API_KEY`, `GEMINI_API_KEY`); generated bridge secret lands here too. Mode 600, never committed |
+| env `TOUCHBAR_FLOW` | FLOW field preset (default `classic`, the owner-approved field) |
+| env `TOUCHBAR_ROTATE` / `TOUCHBAR_FLIP_X` | Panel orientation / touch mirroring |
+| Theme files | Colors and font come from the active Omarchy theme |
+
 ## Fleet naming (optional)
 
 Display names and ssh aliases that differ from Tailscale DNS labels
@@ -81,13 +112,16 @@ this daemon created is closed when its viewer closes.
 ## Development
 
 ```bash
-python3 -m unittest test_touchbar -v   # 9 focused regression tests
+python3 -m unittest discover -v   # bar + voice regression suites
 python3 touchbar.py --snapshot /tmp/tb-snap   # render every view offscreen
 ```
 
 Key sources: `touchbar.py` (daemon, renderer, session discovery),
-`voice_agent.py` (realtime voice), `test_touchbar.py` (tap matrix,
-rail priority, notification dismiss, session ownership).
+`voice_agent.py` (voice client + local tools), `llm_bridge.py`
+(custom brain endpoint), `apply_agent.py` (profile → ElevenLabs
+agent), `test_touchbar.py` / `test_voice_agent.py` (regressions:
+tap matrix, rail priority, session ownership, FLOW field shape,
+voice gain/jobs/metrics/profile consistency).
 
 ## License
 

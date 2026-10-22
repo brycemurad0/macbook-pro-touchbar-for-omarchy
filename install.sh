@@ -8,13 +8,19 @@ DEST="$HOME/.config/omarchy/touchbar"
 echo "==> install files to $DEST"
 install -Dm755 "$DIR/touchbar.py" "$DEST/touchbar.py"
 install -Dm755 "$DIR/voice_agent.py" "$DEST/voice_agent.py"
+install -Dm755 "$DIR/llm_bridge.py" "$DEST/llm_bridge.py"
+install -Dm755 "$DIR/apply_agent.py" "$DEST/apply_agent.py"
 install -Dm755 "$DIR/restore.sh" "$DEST/restore.sh"
 install -Dm644 "$DIR/systemd/omarchy-touchbar.service" \
   "$HOME/.config/systemd/user/omarchy-touchbar.service"
 install -Dm644 "$DIR/systemd/omarchy-voice.service" \
   "$HOME/.config/systemd/user/omarchy-voice.service"
+install -Dm644 "$DIR/systemd/omarchy-llm-bridge.service" \
+  "$HOME/.config/systemd/user/omarchy-llm-bridge.service"
 [ -f "$DEST/voice-config.json" ] || \
   install -Dm644 "$DIR/voice-config.example.json" "$DEST/voice-config.json"
+[ -f "$DEST/agent-profile.json" ] || \
+  install -Dm644 "$DIR/agent-profile.example.json" "$DEST/agent-profile.json"
 
 echo "==> uinput udev rule (key injection needs the input group device)"
 echo 'KERNEL=="uinput", GROUP="input", MODE="0660", TAG+="uaccess"' \
