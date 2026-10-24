@@ -30,6 +30,7 @@ import math
 import os
 import re
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -85,6 +86,60 @@ KEY_F = {i: ([59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88][i - 1]) for i in r
 KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MUTE = 115, 114, 113
 KEY_PLAYPAUSE, KEY_PREVIOUSSONG, KEY_NEXTSONG = 164, 165, 163
 KEY_FN = 464
+
+
+def _evdev_name(ev):
+    try:
+        return open(f"/sys/class/input/{ev}/device/name").read().strip()
+    except OSError:
+        return ""
+
+
+def _evdev_has_abs(ev):
+    try:
+        caps = open(f"/sys/class/input/{ev}/device/capabilities/abs").read().strip()
+    except OSError:
+        return False
+    return caps not in ("", "0")
+
+
+def find_touchbar_evdev():
+    """Hardware Touch Bar touchscreen.
+
+    Event numbers are not stable. On this boot event1 is the SPI keyboard
+    and the bar is event3; opening a fixed node made every tap a no-op.
+    """
+    for ev in sorted(os.listdir("/dev/input")):
+        if not ev.startswith("event"):
+            continue
+        if "touch bar" in _evdev_name(ev).lower() and _evdev_has_abs(ev):
+            return f"/dev/input/{ev}"
+    path = "/dev/input/by-path/platform-235100000.spi-cs-0-event"
+    return path if os.path.exists(path) else None
+
+
+def find_keyboard_evdev():
+    for ev in sorted(os.listdir("/dev/input")):
+        if not ev.startswith("event"):
+            continue
+        name = _evdev_name(ev).lower()
+        if "keyboard" in name and "touch" not in name:
+            return f"/dev/input/{ev}"
+    path = "/dev/input/by-path/platform-23510c000.spi-cs-0-event-kbd"
+    return path if os.path.exists(path) else None
+
+
+def iter_activity_evdevs(exclude):
+    """Other real input devices, so typing keeps the bar awake."""
+    for ev in sorted(os.listdir("/dev/input")):
+        if not ev.startswith("event"):
+            continue
+        path = f"/dev/input/{ev}"
+        if path in exclude:
+            continue
+        if "omarchy touchbar" in _evdev_name(ev).lower():
+            continue
+        yield path
 
 VIEWS = ["flow", "keys", "ctrl", "live", "dev"]
 # (id, card label) in DEV-tab order; SSH-only is the pure-shell option
@@ -155,6 +210,12 @@ FLIP_TOUCH_X = os.environ.get("TOUCHBAR_FLIP_X", "0") == "1"
 
 def clamp(v, lo=0.0, hi=1.0):
     return lo if v < lo else hi if v > hi else v
+
+
+def sess_key(a):
+    """Identity of a live session across FLOW bubbles / LIVE cards."""
+    return ("agent", a.get("node"), a.get("kind"),
+            a.get("pid"), a.get("tmux"))
 
 
 def lerp(a, b, t):
@@ -395,20 +456,38 @@ class DRMDisplay:
                     self.conn_id = cid
                     self.mode = ModeInfo.from_buffer_copy(
                         ctypes.string_at(ctypes.addressof(mode), ctypes.sizeof(ModeInfo)))
+                    # After a cold boot the DSI connector is connected and has a
+                    # mode, but no encoder has a CRTC assigned yet (enabled=disabled).
+                    # Requiring an already-active CRTC deadlocks the daemon: it
+                    # exits before the modeset that would assign one. Claim the
+                    # first CRTC the encoder can drive.
                     enc_id = conn.contents.encoder_id
                     if enc_id:
                         enc = libdrm.drmModeGetEncoder(self.fd, enc_id)
-                        self.crtc_id = enc.contents.crtc_id
-                        libdrm.drmModeFreeEncoder(enc)
+                        if enc and enc.contents.crtc_id:
+                            self.crtc_id = enc.contents.crtc_id
+                        if enc:
+                            libdrm.drmModeFreeEncoder(enc)
                     if not self.crtc_id:
                         for j in range(conn.contents.count_encoders):
                             enc = libdrm.drmModeGetEncoder(self.fd, conn.contents.encoders[j])
-                            if enc and enc.contents.crtc_id:
+                            if not enc:
+                                continue
+                            if enc.contents.crtc_id:
                                 self.crtc_id = enc.contents.crtc_id
-                                libdrm.drmModeFreeEncoder(enc)
+                            else:
+                                mask = enc.contents.possible_crtcs
+                                for k, crtc in enumerate(res_crtcs):
+                                    if mask & (1 << k):
+                                        self.crtc_id = crtc
+                                        print(
+                                            f"touchbar: connector {cid} has no active CRTC; "
+                                            f"claiming possible CRTC {crtc}",
+                                            file=sys.stderr)
+                                        break
+                            libdrm.drmModeFreeEncoder(enc)
+                            if self.crtc_id:
                                 break
-                            if enc:
-                                libdrm.drmModeFreeEncoder(enc)
                     libdrm.drmModeFreeConnector(conn)
                     break
             libdrm.drmModeFreeConnector(conn)
@@ -620,6 +699,10 @@ class State:
         self.mem_used_gb = 0.0
         self.mem_total_gb = 0.0
         self.sessions_today = {}  # fleet: harness -> session files touched today
+        self.weather = None     # {temp, cond, place} for FLOW dashboard
+        self.weather_enabled = False  # daemon turns on (never in tests)
+        self._weather_next = 0.0
+        self._weather_thread = None
         self.uptime_sec = 0
         self._prev_cpu = None
         self.energy = 0.10      # smoothed flow energy 0..1
@@ -797,10 +880,11 @@ class State:
         try:
             proc = subprocess.run(
                 ["ssh"] + self.SSH_SCAN_OPTS + [e["ssh"],
-                 "ps -eo pid=,ppid=,etimes=,args=; echo __TBSESS__; "
+                 "ps -eo pid=,ppid=,etime=,args=; echo __TBSESS__; "
                  "tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null; "
                  "echo __TBPANES__; "
-                 "tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null"],
+                 "tmux list-panes -a -F '#{pane_pid} #{session_name} "
+                 "#{pane_current_path}' 2>/dev/null; true"],
                 capture_output=True, text=True, timeout=6)
             if proc.returncode != 0:
                 raise OSError("ssh scan failed")
@@ -809,14 +893,43 @@ class State:
             return e, "", True  # unreachable != "sessions ended"
 
     @staticmethod
+    def _etime_to_s(text):
+        """ps elapsed -> seconds. Portable across the fleet: Linux
+        and macOS both print `etime` as [[days-]hh:]mm:ss, while
+        `etimes` (plain seconds) does not exist on macOS at all —
+        asking for it made the scan command degrade so every mac
+        process was discarded and Mac sessions never discovered."""
+        text = text.strip()
+        if text.isdigit():
+            return float(text)
+        days, _, rest = text.rpartition("-") if "-" in text else ("", "", text)
+        parts = [int(p) for p in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return float((int(days or 0) * 24 + parts[0]) * 3600
+                     + parts[1] * 60 + parts[2])
+
+    @staticmethod
     def _parse_remote(e, out):
         """(agents, {tmux: attached}) from one node's scan output.
         A remote card must be a session you can land in: the harness
         has to live inside a tmux pane. Harness-named daemons running
         loose on a node (agent services, forgotten desktop terminals)
         are not sessions — they can neither be focused nor closed."""
-        ps_part, _, rest = out.partition("__TBSESS__")
-        sess_part, _, pane_part = rest.partition("__TBPANES__")
+        # exact-LINE markers: the scan's own cmdline appears in the
+        # ps listing carrying the marker text, so a substring split
+        # truncates the process list at the scanner's own pid and
+        # every harness above it silently vanishes (found live on
+        # Jarvis, 2026-10-22: its agy session was invisible)
+        _lines = out.splitlines()
+        try:
+            _i = _lines.index("__TBSESS__")
+            _j = _lines.index("__TBPANES__")
+        except ValueError:
+            return [], {}
+        ps_part = "\n".join(_lines[:_i])
+        sess_part = "\n".join(_lines[_i + 1:_j])
+        pane_part = "\n".join(_lines[_j + 1:])
         attached = {}
         for line in sess_part.splitlines():
             p = line.rsplit(None, 1)
@@ -826,17 +939,21 @@ class State:
                 except ValueError:
                     pass
         pane_sess = {}
+        pane_path = {}
         for line in pane_part.splitlines():
-            p = line.split(None, 1)
-            if len(p) == 2 and p[0].isdigit():
+            p = line.split(None, 2)
+            if len(p) >= 2 and p[0].isdigit():
                 pane_sess[int(p[0])] = p[1]
+                if len(p) == 3:
+                    pane_path[int(p[0])] = p[2]
         procs = {}
         for line in ps_part.splitlines():
             parts = line.split(None, 3)
             if len(parts) < 4 or not parts[0].isdigit():
                 continue
             try:
-                procs[int(parts[0])] = (int(parts[1]), float(parts[2]), parts[3])
+                procs[int(parts[0])] = (int(parts[1]),
+                                        State._etime_to_s(parts[2]), parts[3])
             except ValueError:
                 continue
 
@@ -845,6 +962,16 @@ class State:
             for _ in range(12):
                 if cur in pane_sess:
                     return pane_sess[cur]
+                if cur not in procs or procs[cur][0] <= 1:
+                    return None
+                cur = procs[cur][0]
+            return None
+
+        def path_of(pid):
+            cur = pid
+            for _ in range(12):
+                if cur in pane_path:
+                    return pane_path[cur]
                 if cur not in procs or procs[cur][0] <= 1:
                     return None
                 cur = procs[cur][0]
@@ -866,9 +993,15 @@ class State:
                 continue  # loose daemon/process: not a landable session
             key = (e["ssh"], sess)
             if key not in best or elapsed > best[key]["elapsed"]:
+                # what is being worked on = the pane's project dir,
+                # same as a local session's cwd basename; the node
+                # name alone (the old detail) says nothing aloud
+                cwd = path_of(pid) or ""
+                project = os.path.basename(cwd.rstrip("/")) or e["name"]
                 best[key] = {
                     "kind": hid, "glyph": "◆", "label": e["name"],
-                    "detail": f"{hid} \u00b7 {e['name']}",
+                    "detail": f"{hid} \u00b7 {project}",
+                    "project": project,
                     "elapsed": elapsed, "active": False, "percent": None,
                     "pid": 0, "remote": True, "node": e["ssh"],
                     "node_name": e["name"], "window": None, "tmux": sess,
@@ -1149,6 +1282,108 @@ class State:
         except OSError:
             pass
 
+    def _publish_sessions(self):
+        """Publish the daemon's live session truth for consumers
+        (the voice agent) as sessions.json in the state dir.
+
+        Separation of concerns, owner-ruled 2026-10-22: THIS daemon
+        is the only session scanner in the system. The voice agent
+        used to run its own divergent tmux scan and routinely
+        reported 'no sessions' while the bar showed several — it
+        now reads this file and nothing else for session state.
+        Atomic write, only when the payload actually changed."""
+        now = time.time()
+        with self.lock:
+            agents = [dict(a) for a in self.agents]
+            nodes = [dict(e) for e in self.nodes_detail]
+        sessions = []
+        for a in agents:
+            if a.get("kind") == "goal":
+                continue  # goals are jobs, reported on their own path
+            elapsed = float(a.get("elapsed") or 0)
+            sessions.append({
+                "node": a.get("node") or "here",
+                "node_name": a.get("node_name")
+                    or node_alias(os.uname().nodename),
+                "kind": a.get("kind"), "tmux": a.get("tmux"),
+                "project": a.get("project") or a.get("label") or "",
+                "detail": a.get("detail") or a.get("kind") or "",
+                "started_at": now - elapsed, "elapsed_s": elapsed,
+                "active": bool(a.get("active")),
+                "attached": bool(a.get("attached")),
+                "remote": bool(a.get("remote")),
+            })
+        core = {"nodes": [{"name": e.get("name"), "ssh": e.get("ssh"),
+                           "online": bool(e.get("online"))}
+                          for e in nodes],
+                "sessions": sessions}
+        blob = json.dumps(core, sort_keys=True)
+        # unchanged truth still needs a heartbeat ts, or consumers
+        # would read a quiet-but-healthy fleet as a dead daemon
+        if blob == getattr(self, "_sessions_blob", None) and \
+                now - getattr(self, "_sessions_written", 0) < 30:
+            return
+        self._sessions_blob = blob
+        self._sessions_written = now
+        blob = json.dumps({"ts": now, **core}, sort_keys=True)
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            path = os.path.join(STATE_DIR, "sessions.json")
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(blob)
+            os.rename(tmp, path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _parse_weather(data):
+        """wttr.in j1 payload -> {temp, cond, place} or None."""
+        try:
+            cur = (data.get("current_condition") or [{}])[0]
+            units_f = str((_FLEET_CFG.get("weather_units") or "F")).upper() != "C"
+            temp = cur.get("temp_F" if units_f else "temp_C")
+            cond = ((cur.get("weatherDesc") or [{}])[0].get("value") or "").strip()
+            area = (data.get("nearest_area") or [{}])[0]
+            place = ((area.get("areaName") or [{}])[0].get("value") or "").strip()
+            if temp is None or not cond:
+                return None
+            return {"temp": f"{int(float(temp))}\u00b0", "cond": cond[:20],
+                    "place": place}
+        except Exception:
+            return None
+
+    def _fetch_weather(self):
+        """Outdoor weather for the FLOW dashboard, refreshed in a
+        side thread (never blocks the collector): wttr.in with the
+        optional fleet.json weather_location (empty = locate by
+        egress IP). Any failure just leaves the last good value —
+        weather is decoration, never a reason to stall the bar."""
+        import urllib.parse
+        import urllib.request
+        try:
+            loc = str(_FLEET_CFG.get("weather_location") or "").strip()
+            url = "https://wttr.in/" + urllib.parse.quote(loc) + "?format=j1"
+            req = urllib.request.Request(url, headers={"User-Agent": "curl"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                import json as _j
+                parsed = self._parse_weather(_j.load(r))
+            if parsed:
+                self.weather = parsed
+        except Exception:
+            pass
+
+    def _maybe_fetch_weather(self):
+        now = time.time()
+        if now < self._weather_next:
+            return
+        if self._weather_thread is not None and self._weather_thread.is_alive():
+            return
+        self._weather_next = now + 1800  # 30 min; failures retry then too
+        self._weather_thread = threading.Thread(target=self._fetch_weather,
+                                                daemon=True)
+        self._weather_thread.start()
+
     # -- main loop -------------------------------------------------------
     def collect_loop(self):
         n = 0
@@ -1184,47 +1419,9 @@ class State:
         else:
             self._mic_monitor(False)
             self.mic_level *= 0.6
+        if self.weather_enabled:
+            self._maybe_fetch_weather()
 
-    def _mic_monitor(self, on):
-        if on and self._mic_thread is None:
-            try:
-                proc = subprocess.Popen(
-                    ["parec", "--format=s16le", "--rate=16000", "--channels=1"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            except OSError:
-                return
-            if getattr(proc, "stdout", None) is None:
-                return
-            self._mic_proc = proc
-            self._mic_thread = threading.Thread(
-                target=self._mic_read, args=(proc,), daemon=True)
-            self._mic_thread.start()
-        elif not on and self._mic_proc is not None:
-            try:
-                self._mic_proc.terminate()
-            except Exception:
-                pass
-            self._mic_proc = None
-            self._mic_thread = None
-
-    def _mic_read(self, proc):
-        import array
-        try:
-            while True:
-                buf = proc.stdout.read(3200)  # 100 ms of 16 kHz s16 mono
-                if not buf:
-                    break
-                a = array.array("h")
-                a.frombytes(buf[:len(buf) // 2 * 2])
-                if not a:
-                    continue
-                rms = math.sqrt(sum(s * s for s in a) / len(a))
-                lvl = min(1.0, rms / 900.0)
-                # fast attack, gentle release: breathes with speech
-                self.mic_level = lvl if lvl > self.mic_level \
-                    else max(lvl, self.mic_level * 0.86)
-        except Exception:
-            pass
         # cpu
         try:
             parts = [int(x) for x in open("/proc/stat").readline().split()[1:]]
@@ -1367,6 +1564,7 @@ class State:
             agents = _kept
             with self.lock:
                 self.agents = leftover + agents + list(self._remote_agents)
+            self._publish_sessions()
         # energy: the flow's heartbeat
         with self.lock:
             active_agents = sum(1 for a in self.agents if a["active"])
@@ -1375,6 +1573,47 @@ class State:
                        + active_agents * 0.16 + min(n_agents, 4) * 0.03
                        + clamp(self.load1 / 8.0) * 0.15)
         self.energy = lerp(self.energy, target, 0.06)
+
+    def _mic_monitor(self, on):
+        if on and self._mic_thread is None:
+            try:
+                proc = subprocess.Popen(
+                    ["parec", "--format=s16le", "--rate=16000", "--channels=1"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except OSError:
+                return
+            if getattr(proc, "stdout", None) is None:
+                return
+            self._mic_proc = proc
+            self._mic_thread = threading.Thread(
+                target=self._mic_read, args=(proc,), daemon=True)
+            self._mic_thread.start()
+        elif not on and self._mic_proc is not None:
+            try:
+                self._mic_proc.terminate()
+            except Exception:
+                pass
+            self._mic_proc = None
+            self._mic_thread = None
+
+    def _mic_read(self, proc):
+        import array
+        try:
+            while True:
+                buf = proc.stdout.read(3200)  # 100 ms of 16 kHz s16 mono
+                if not buf:
+                    break
+                a = array.array("h")
+                a.frombytes(buf[:len(buf) // 2 * 2])
+                if not a:
+                    continue
+                rms = math.sqrt(sum(s * s for s in a) / len(a))
+                lvl = min(1.0, rms / 900.0)
+                # fast attack, gentle release: breathes with speech
+                self.mic_level = lvl if lvl > self.mic_level \
+                    else max(lvl, self.mic_level * 0.86)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- actions
@@ -1473,19 +1712,125 @@ class Actions:
         subprocess.Popen(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def focus_client(self, addr):
+    @staticmethod
+    def _hypr_env():
         # This Hyprland build speaks Lua at the IPC layer: raw socket
-        # "dispatch focuswindow" is rejected, but hyprctl with the
-        # instance signature in env + an hl.dsp.focus call works.
+        # dispatch is rejected, but hyprctl with the instance
+        # signature in env + an hl.dsp.* call works.
         path = hypr_socket_path()
         env = dict(os.environ)
         env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         if path:
             env["HYPRLAND_INSTANCE_SIGNATURE"] = \
                 os.path.basename(os.path.dirname(path))
+        return env
+
+    def focus_client(self, addr):
         subprocess.Popen(
             ["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{addr}" }})'],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            env=self._hypr_env(), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+
+    def close_client(self, addr):
+        """Close one window by address (the swipe-away ✕ on FLOW)."""
+        if not addr:
+            return
+        subprocess.Popen(
+            ["hyprctl", "dispatch",
+             f'hl.dsp.window.close({{ window = "address:{addr}" }})'],
+            env=self._hypr_env(), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+
+    def dismiss_resume(self, alias=None, harness=None, tmux=None):
+        """Forget any quick-resume suggestion for a session: a
+        swipe-close is final, so FLOW must not offer to resurrect
+        the ssh session the owner just threw away."""
+        def matches(e):
+            if alias and e.get("alias") != alias:
+                return False
+            if tmux and e.get("tmux") == tmux:
+                return True
+            return bool(harness and e.get("harness") == harness)
+        with self.st.lock:
+            kept = [e for e in self.st.closed_resumes if not matches(e)]
+            if len(kept) == len(self.st.closed_resumes):
+                return
+            self.st.closed_resumes = kept
+        if self.st.persist_resumes:
+            _resume_save(kept)
+
+    def _window_addr_for_pid(self, pid):
+        """Hyprland address hosting a process (walk its ppid chain)."""
+        try:
+            by_pid = {c["pid"]: c["address"]
+                      for c in json.loads(hypr_request("j/clients"))}
+        except Exception:
+            return None
+        cur = pid
+        for _ in range(12):
+            if cur in by_pid:
+                return by_pid[cur]
+            try:
+                stat = open(f"/proc/{cur}/stat").read()
+                cur = int(stat.rsplit(")", 1)[1].split()[1])  # ppid
+            except (OSError, ValueError, IndexError):
+                return None
+            if cur <= 1:
+                return None
+        return None
+
+    def close_session(self, a):
+        """Swipe-away close for a FLOW session bubble (owner
+        2026-10-23): local = close its hosting window; remote =
+        kill its exact tmux session on the node and close any local
+        viewer. Either way, any ssh quick-resume suggestion for it
+        is dismissed and none is left behind (the launched-viewer
+        record is dropped first, so reap_closed cannot re-add one
+        when the viewer window dies)."""
+        if not a:
+            return
+        if a.get("remote"):
+            alias, tmux = a.get("node"), a.get("tmux")
+            self.dismiss_resume(alias, a.get("kind"), tmux)
+            # close the local viewer, if we launched one, and drop
+            # its record before it dies: no resume may be left
+            for key, rec in list(self._launched.items()):
+                sess = rec.get("session") if isinstance(rec, dict) else None
+                if key[0] == alias and (key[1] in (tmux, a.get("kind"))
+                                        or (tmux and sess == tmux)):
+                    pid = rec.get("pid") if isinstance(rec, dict) else rec
+                    addr = self._window_addr_for_pid(pid) if pid else None
+                    del self._launched[key]
+                    if addr:
+                        self.close_client(addr)
+            if alias and tmux:
+                safe = tmux.replace("'", "'\\''")
+                subprocess.Popen(["ssh", "-o", "BatchMode=yes",
+                                  "-o", "ConnectTimeout=4", alias,
+                                  f"tmux kill-session -t '{safe}'"],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            with self.st.lock:  # bubble goes away at once
+                self.st._remote_agents = [
+                    x for x in self.st._remote_agents
+                    if not (x.get("node") == alias
+                            and x.get("tmux") == tmux)]
+                self.st.agents = [
+                    x for x in self.st.agents
+                    if not (x.get("remote") and x.get("node") == alias
+                            and x.get("tmux") == tmux)]
+            return
+        addr = a.get("window")
+        if not addr and a.get("pid"):
+            addr = self._window_addr_for_pid(a["pid"])
+        if addr:
+            self.close_client(addr)
+        elif a.get("pid"):
+            # no hosting window to close: end the session process
+            try:
+                os.kill(a["pid"], signal.SIGTERM)
+            except OSError:
+                pass
 
     def _focus_launched(self, key):
         """If a terminal we launched for key is still open, focus it
@@ -1737,6 +2082,10 @@ class Renderer:
         self.dev_state = ("host", None, None)  # (step, node dict|None=local, harness id)
         self.live_sel = None  # LIVE two-tap selection key, set by the daemon
         self.live_sel_at = 0.0
+        self.flow_close_key = None  # FLOW swipe-revealed \u2715 key (daemon-set)
+        self.flow_close_at = 0.0
+        self.dev_sel = None  # DEV two-tap armed key, set by the daemon
+        self.dev_sel_at = 0.0
         self.ripples = []     # FLOW touch ripples [(x, y, t0)]
         self.touch_xy = None  # FLOW finger position while touching
         self.touch_t = 0.0
@@ -1980,7 +2329,7 @@ class Renderer:
                     * math.exp(-age * 1.5) * 0.8
         return w
 
-    def view_flow(self, ctx, hits, t, pressed, background=False):
+    def view_flow(self, ctx, hits, t, pressed, background=False, scroll=0):
         # smooth energy per frame (the collector steps it once a second;
         # per-frame easing keeps the current from micro-lurching)
         e = self._e_smooth = lerp(getattr(self, "_e_smooth", self.st.energy),
@@ -2105,16 +2454,28 @@ class Renderer:
             # of FLOW. They dock left (status chips stay up); a closed
             # ssh session's quick-resume pill docks in the same spot
             # when no notification is live.
+            dock_end = RAIL_W + 12
             if self._notif_active(t):
-                self._notify_pill(ctx, hits, t, anchor="left")
+                dock_end = self._notify_pill(ctx, hits, t, anchor="left") \
+                    or dock_end
             else:
-                self._flow_resume_pill(ctx, hits)
-            self._flow_chips(ctx, hits, t)
+                dock_end = self._flow_resume_pill(ctx, hits) or dock_end
+            # the small dashboard (time/date/battery/weather) sits
+            # centre-field when nothing is running; when sessions
+            # come up it moves right and the session bubbles take
+            # the left as a scrollable strip (owner 2026-10-22)
+            has_sessions = bool(self._live_agents())
+            dash_x = self._flow_dashboard(ctx, hits, t,
+                                          anchored=has_sessions)
+            strip_r = (dash_x - 10) if (has_sessions and dash_x) else None
+            max_scroll = self._flow_sessions(ctx, hits, t, dock_end,
+                                             strip_r, scroll)
             self._voice_switch(ctx, hits, t)
             if self.pod_open:
                 self._flow_pod(ctx, hits, t, pressed)
             else:
                 self._flow_handle(ctx, hits)
+            return max_scroll
 
     def _voice_switch(self, ctx, hits, t):
         """Persistent voice-agent switch, bottom-right of FLOW. Shows live
@@ -2314,59 +2675,139 @@ class Renderer:
             ctx.fill()
         return bw + 5
 
-    def _flow_chips(self, ctx, hits, t):
-        # compact status pill, centered, hugging its content so the
-        # ASCII field stays visible around it: utilization, time,
-        # battery icon + percentage in a row (tap: drill down)
-        now = time.localtime()
-        zone_r = W - (self.POD_W + 26) if self.pod_open else W - 140
-        zx0, zx1 = RAIL_W + 12, zone_r
-        if zx1 - zx0 < 320:
-            return
+    def _live_agents(self):
         with self.st.lock:
-            na = sum(1 for a in self.st.agents if a["active"])
-            nt = len(self.st.agents)
-        util = f"CPU {int(self.st.cpu * 100)}%"
-        if nt:
-            util += f"  {na}/{nt}"
-        tstr = time.strftime("%H:%M", now)
+            return [a for a in self.st.agents if a.get("kind") != "goal"]
+
+    def _flow_dashboard(self, ctx, hits, t, anchored):
+        """The small main dashboard: time, date, battery, and local
+        weather/outdoor temp. Centre-field when the network is
+        quiet; anchored right when session bubbles take the left.
+        Tap drills into the fleet view. Returns the pill's left
+        edge (None when there is no room to draw it)."""
+        zone_r = W - (self.POD_W + 18) if self.pod_open else W - 140
+        zx0 = RAIL_W + 12
+        if zone_r - zx0 < 340:
+            return None
+        now = time.localtime()
+        parts = []  # (text, size, color)
+        parts.append((time.strftime("%H:%M", now), 17,
+                      self.th["bright_foreground"]))
+        parts.append((time.strftime("%a %b %d", now), 12,
+                      self.th["bright_foreground"]))
+        batt_w = 0
+        if self.st.battery >= 0:
+            parts.append((f"{self.st.battery}%", 13,
+                          self.batt_color(self.st.battery,
+                                          self.st.charging)))
+            batt_w = 37  # icon + gap allowance, drawn manually below
+        if self.st.weather:
+            w = self.st.weather
+            parts.append((f"{w['temp']} {w['cond']}", 12,
+                          self.th["bright_foreground"]))
         ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL,
                              cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(15)
-        uw = ctx.text_extents(util).width
-        ctx.set_font_size(19)
-        tw = ctx.text_extents(tstr).width
-        batt_w = 0
-        pstr, col = "", None
-        if self.st.battery >= 0:
-            pstr = f"{self.st.battery}%"
-            col = self.batt_color(self.st.battery, self.st.charging)
-            ctx.set_font_size(15)
-            batt_w = 31 + 6 + ctx.text_extents(pstr).width
-        gap = 26
-        content = uw + gap + tw + (gap + batt_w if batt_w else 0)
-        pw = content + 36
-        px = (zx0 + zx1) / 2 - pw / 2
-        self.rr(ctx, px, 13, pw, 34, 9)
-        ctx.set_source_rgba(*self.th["darker_background"], 0.78)
+        widths = []
+        for text, size, _c in parts:
+            ctx.set_font_size(size)
+            widths.append(ctx.text_extents(text).width)
+        gap = 20
+        content = sum(widths) + gap * (len(parts) - 1) + batt_w
+        pw = content + 32
+        px = (zone_r - pw) if anchored else (zx0 + zone_r) / 2 - pw / 2
+        y, hh = 13, 34
+        self.rr(ctx, px, y, pw, hh, 9)
+        ctx.set_source_rgba(*self.th["darker_background"], 0.82)
         ctx.fill()
-        self.rr(ctx, px, 13, pw, 34, 9)
+        self.rr(ctx, px, y, pw, hh, 9)
         ctx.set_source_rgba(*self.th["muted"], 0.55)
         ctx.set_line_width(1)
         ctx.stroke()
-        x = px + 18
-        self.text(ctx, util, x, 37, 15, self.th["bright_foreground"],
-                  cairo.FONT_WEIGHT_BOLD)
-        x += uw + gap
-        self.text(ctx, tstr, x, 37, 19, self.th["bright_foreground"],
-                  cairo.FONT_WEIGHT_BOLD)
-        x += tw + gap
-        if batt_w:
-            iw = self._batt_icon(ctx, x, 30, self.st.battery,
-                                 self.st.charging)
-            self.text(ctx, pstr, x + iw + 6, 37, 15, col,
+        x = px + 16
+        for (text, size, col), wdt in zip(parts, widths):
+            if col == self.batt_color(self.st.battery, self.st.charging) \
+                    and text.endswith("%") and self.st.battery >= 0:
+                iw = self._batt_icon(ctx, x, y + hh / 2,
+                                     self.st.battery, self.st.charging)
+                x += iw + 6
+            self.text(ctx, text, x, y + hh / 2 + size * 0.36, size, col,
                       cairo.FONT_WEIGHT_BOLD)
-        hits.append((px, 13, pw, 34, "view", "fleet"))
+            x += wdt + gap
+        hits.append((px, y, pw, hh, "view", "fleet"))
+        return px
+
+    def _flow_sessions(self, ctx, hits, t, left, right, scroll=0):
+        """The scrollable session strip on FLOW's left: bubbles for
+        every live session across the network (harness · project ·
+        how long). Dragging scrolls the strip; tapping a bubble
+        lands in LIVE with that session armed, so opening it still
+        takes a second, deliberate tap there. Returns max_scroll."""
+        zone_r = (W - (self.POD_W + 18) if self.pod_open else W - 140) \
+            if right is None else right
+        zx0, zx1 = max(RAIL_W + 12, left), zone_r
+        if zx1 - zx0 < 200:
+            return 0
+        agents = self._live_agents()
+        if not agents:
+            return 0
+        y, hh = 13, 34
+        ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL,
+                             cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(13)
+        items = [(a, f"{a.get('glyph', '\u25c6')} "
+                     f"{a.get('detail', a.get('kind', '?'))} \u00b7 "
+                     f"{fmt_elapsed(a.get('elapsed', 0))}")
+                 for a in agents]
+        # a left-swiped bubble grows a \u2715 slot on its right edge
+        widths = [ctx.text_extents(l).width + 28
+                  + (36 if sess_key(a) == self.flow_close_key else 0)
+                  for a, l in items]
+        total = sum(widths) + 8 * (len(widths) - 1)
+        max_scroll = max(0, int(total - (zx1 - zx0)))
+        x = zx0 - scroll
+        for (a, label), w in zip(items, widths):
+            bx = x
+            x += w + 8
+            if bx + w < zx0 + 4 or bx > zx1 - 4:
+                continue  # fully outside the strip: not drawn, not a hit
+            self.rr(ctx, bx, y, w, hh, 9)
+            ctx.set_source_rgba(*self.th["darker_background"], 0.82)
+            ctx.fill()
+            self.rr(ctx, bx, y, w, hh, 9)
+            ctx.set_source_rgba(*self.th["muted"], 0.55)
+            ctx.set_line_width(1)
+            ctx.stroke()
+            col = self.th["green"] if a.get("active") \
+                else self.th["dark_foreground"]
+            if a.get("active"):
+                pulse = 0.55 + 0.45 * math.sin(t * 4)
+                ctx.set_source_rgba(*col, pulse)
+            else:
+                ctx.set_source_rgba(*col, 0.9)
+            ctx.arc(bx + 13, y + hh / 2, 3.6, 0, 6.29)
+            ctx.fill()
+            self.text(ctx, label, bx + 23, y + hh / 2 + 5, 13,
+                      self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
+            if sess_key(a) == self.flow_close_key:
+                # revealed close button: red slot, white \u2715; its hit
+                # is appended first so it outranks the bubble body
+                self.rr(ctx, bx + w - 34, y + 3, 31, hh - 6, 7)
+                ctx.set_source_rgba(*self.th["red"], 0.9)
+                ctx.fill()
+                self.text(ctx, "\u2715", bx + w - 26, y + hh / 2 + 6, 15,
+                          self.th["bright_foreground"],
+                          cairo.FONT_WEIGHT_BOLD)
+                hits.append((bx + w - 36, y, 36, hh, "flowclose", a))
+                hits.append((bx, y, w - 36, hh, "flowsess", a))
+            else:
+                hits.append((bx, y, w, hh, "flowsess", a))
+        if max_scroll > 0 and scroll < max_scroll - 4:
+            self.text(ctx, "\u203a", zx1 - 16, y + hh / 2 + 7, 20,
+                      self.th["accent"], cairo.FONT_WEIGHT_BOLD)
+        if scroll > 4:
+            self.text(ctx, "\u2039", zx0 + 4, y + hh / 2 + 7, 20,
+                      self.th["accent"], cairo.FONT_WEIGHT_BOLD)
+        return max_scroll
 
     # -- KEYS ---------------------------------------------------------------
     def view_keys(self, ctx, hits, t, pressed):
@@ -2631,8 +3072,10 @@ class Renderer:
         cw = min(320, (avail - (n - 1) * 8) / max(n, 1))
         right = x0 + avail
         for i, e in enumerate(online):
+            armed = getattr(self, "dev_sel", None) == \
+                ("host", e.get("host") or "LOCAL")
             self._dev_card(ctx, hits, x0 + i * (cw + 8), 22, cw, 32,
-                           e["name"][:18], "node", e, size=13)
+                           e["name"][:18], "node", e, sel=armed, size=13)
         off_block = len(offline) * cw + max(0, len(offline) - 1) * 8
         for j, e in enumerate(offline):
             # offline: pinned to the right edge, shown, never a target
@@ -2655,7 +3098,9 @@ class Renderer:
             bx = x0 + i * (cw + gap)
             if bx + cw < RAIL_W + 220 or bx > W:
                 continue
-            self._dev_card(ctx, hits, bx, 22, cw, 32, label, "harness", hid, size=13)
+            armed = getattr(self, "dev_sel", None) == ("harness", hid)
+            self._dev_card(ctx, hits, bx, 22, cw, 32, label, "harness", hid,
+                           sel=armed, size=13)
         total = len(HARNESSES) * (cw + gap)
         max_scroll = max(0, int(total - (W - (RAIL_W + 228))))
         if max_scroll > 0 and scroll < max_scroll - 4:
@@ -2693,13 +3138,17 @@ class Renderer:
         self.text(ctx, cmd[:52], bx + 34 + sw, 32, 11, self.th["dark_foreground"])
         self.text(ctx, "yolo mode \u00b7 tap LAUNCH to open in a terminal", bx + 20, 47, 10,
                   self.th["dark_foreground"])
-        # buttons
+        # buttons (LAUNCH is two-tap like the rest of DEV: an armed
+        # LAUNCH reads TAP AGAIN until the confirming tap lands)
         lx = bx + cw + 14
+        armed = bool(getattr(self, "dev_sel", None)) and \
+            getattr(self, "dev_sel", (None,))[0] == "launch"
         self.rr(ctx, lx, 7, 210, 46, 11)
-        ctx.set_source_rgba(*self.th["accent"], 0.9)
+        ctx.set_source_rgba(*self.th["accent"], 0.55 if armed else 0.9)
         ctx.fill()
-        self.text(ctx, "LAUNCH >", lx + 52, 38, 16, self.th["darker_background"],
-                  cairo.FONT_WEIGHT_BOLD)
+        self.text(ctx, "TAP AGAIN >" if armed else "LAUNCH >",
+                  lx + 40 if armed else lx + 52, 38, 16,
+                  self.th["darker_background"], cairo.FONT_WEIGHT_BOLD)
         hits.append((lx, 7, 210, 46, "launch", None))
         self._dev_card(ctx, hits, lx + 222, 7, 120, 46, "< BACK", "devback", None, size=13)
 
@@ -2727,6 +3176,14 @@ class Renderer:
                 self.rr(ctx, bx, 22, cw, 32, 8)
                 ctx.set_source_rgba(*self.th["lighter_background"], 0.55)
                 ctx.fill()
+                if getattr(self, "dev_sel", None) == \
+                        ("host", e.get("host") or "LOCAL"):
+                    # DEV two-tap arm, visible here too (this view
+                    # feeds the same DEV host choice)
+                    self.rr(ctx, bx, 22, cw, 32, 8)
+                    ctx.set_source_rgba(*self.th["accent"], 0.9)
+                    ctx.set_line_width(1.6)
+                    ctx.stroke()
                 dot = self.th["bright_green"] if e.get("online") else self.th["dark_foreground"]
                 ctx.set_source_rgb(*dot)
                 ctx.arc(bx + 14, 38, 4, 0, 6.29)
@@ -2854,7 +3311,7 @@ class Renderer:
             label += f"  +{len(entries) - 1}"
         ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         ctx.set_font_size(13)
-        w = ctx.text_extents(label).width + 30
+        w = ctx.text_extents(label).width + 30 + 26  # + the \u2715 zone
         x, y, hh = RAIL_W + 12, 13, 34
         self.rr(ctx, x, y, w, hh, 9)
         ctx.set_source_rgba(*self.th["darker_background"], 0.85)
@@ -2865,7 +3322,12 @@ class Renderer:
         ctx.stroke()
         self.text(ctx, label, x + 15, y + hh / 2 + 5, 13,
                   self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
-        hits.append((x, y, w, hh, "resume", e))
+        # explicit \u2715-out: dismiss this resume without launching it
+        self.text(ctx, "\u2715", x + w - 21, y + hh / 2 + 5, 13,
+                  self.th["dark_foreground"], cairo.FONT_WEIGHT_BOLD)
+        hits.append((x + w - 26, y, 26, hh, "resume_x", e))
+        hits.append((x, y, w - 26, hh, "resume", e))
+        return x + w
 
     def _notify_pill(self, ctx, hits, t, anchor="center"):
         n = self.notification
@@ -2874,7 +3336,7 @@ class Renderer:
             ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(13)
             ext = ctx.text_extents(label)
-            w = ext.width + 50
+            w = ext.width + 50 + 26  # + the \u2715 zone
             x, y, hh = RAIL_W + 12, 13, 34
             col = self.th[n["color"]]
             self.rr(ctx, x, y, w, hh, 9)
@@ -2890,14 +3352,17 @@ class Renderer:
             ctx.fill()
             self.text(ctx, label, x + 28, y + hh / 2 + 5, 13,
                       self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
+            self.text(ctx, "\u2715", x + w - 21, y + hh / 2 + 5, 13,
+                      self.th["dark_foreground"], cairo.FONT_WEIGHT_BOLD)
             self._notif_rect = (x, y, w, hh)
-            hits.append((x, y, w, hh, "notify", n))
-            return
+            hits.append((x + w - 26, y, 26, hh, "notify_x", n))
+            hits.append((x, y, w - 26, hh, "notify", n))
+            return x + w
         label = f"{n['label']} \u2014 tap to jump"
         ctx.select_font_face(self.th.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         ctx.set_font_size(15)
         ext = ctx.text_extents(label)
-        w = ext.width + 58
+        w = ext.width + 58 + 26  # + the \u2715 zone
         x = (RAIL_W + W - 84) / 2 - w / 2
         col = self.th[n["color"]]
         self.rr(ctx, x, 10, w, 40, 11)
@@ -2912,10 +3377,13 @@ class Renderer:
         ctx.arc(x + 20, 30, 5, 0, 6.29)
         ctx.fill()
         self.text(ctx, label, x + 34, 38, 15, self.th["bright_foreground"], cairo.FONT_WEIGHT_BOLD)
+        self.text(ctx, "\u2715", x + w - 24, 38, 15,
+                  self.th["dark_foreground"], cairo.FONT_WEIGHT_BOLD)
         # the pill floats ABOVE other views: remember its rect so the
         # daemon can give it first claim on any tap (see Daemon._hit_at)
         self._notif_rect = (x, 10, w, 40)
-        hits.append((x, 10, w, 40, "notify", n))
+        hits.append((x + w - 26, 10, 26, 40, "notify_x", n))
+        hits.append((x, 10, w - 26, 40, "notify", n))
 
     def _draw_flashes(self, ctx, t):
         """Completion events sweep a colored wave across the ASCII field."""
@@ -2966,7 +3434,8 @@ class Renderer:
             ctx.rectangle(0, 0, W, H)
             ctx.fill()
         if view == "flow":
-            self.view_flow(ctx, hits, t, pressed)
+            max_scroll = self.view_flow(ctx, hits, t, pressed,
+                                        scroll=scroll) or 0
         elif view == "dev":
             ctx.save()
             ctx.translate(self.slide_dx, 0)
@@ -3010,9 +3479,14 @@ class Daemon:
             self.st.persist_resumes = False
         else:  # quick-resume survives daemon restarts too
             self.st.closed_resumes = _resume_load()
+            self.st.weather_enabled = True  # FLOW dashboard weather
         self.view = "flow"
+        self.dev_sel = None      # DEV two-tap: armed selection key
+        self.dev_sel_at = 0.0
         self.live_sel = None     # LIVE two-tap: armed selection key
         self.live_sel_at = 0.0   # ... and when it was armed (6 s expiry)
+        self.flow_close_key = None  # FLOW swipe-revealed \u2715 key
+        self.flow_close_at = 0.0    # ... and when (6 s expiry, as LIVE)
         self.dev_node = None     # DEV tab: selected node dict (None = LOCAL)
         self.dev_harness = None  # DEV tab: selected harness id (None until picked)
         self.dev_step = "host"   # DEV tab: host -> harness -> confirm
@@ -3041,17 +3515,25 @@ class Daemon:
 
     # -- input ------------------------------------------------------------
     def input_loop(self):
-        fd = os.open("/dev/input/event1", os.O_RDONLY)
+        touch_path = find_touchbar_evdev()
+        if not touch_path:
+            print("touchbar: no Touch Bar touchscreen found", file=sys.stderr, flush=True)
+            return
+        fd = os.open(touch_path, os.O_RDONLY | os.O_NONBLOCK)
         fds = [fd]
-        # SPI keyboard (Fn summon + global activity) and trackpad (activity).
-        # Like tiny-dfr, ANY system input counts as activity for dimming;
-        # watching only the bar itself dimmed it while the user typed.
-        for cand in ("/dev/input/event3", "/dev/input/event4"):
+        opened = {touch_path}
+        # Keyboard (Fn summon) plus every other real input device. Like
+        # tiny-dfr, typing or trackpad activity must keep the bar awake.
+        for cand in ([find_keyboard_evdev()] + list(iter_activity_evdevs(opened))):
+            if not cand or cand in opened:
+                continue
             try:
-                kfd = os.open(cand, os.O_RDONLY | os.O_NONBLOCK)
-                fds.append(kfd)
+                fds.append(os.open(cand, os.O_RDONLY | os.O_NONBLOCK))
+                opened.add(cand)
             except OSError:
                 pass
+        print(f"touchbar: touch={touch_path} watching {len(fds)} input devices",
+              file=sys.stderr, flush=True)
         cur_x = cur_y = 0
         down = False
         while self.running:
@@ -3094,6 +3576,11 @@ class Daemon:
         # the notification pill overlays every view: it gets first claim on
         # taps inside its rect, never the content underneath it
         r = self.renderer
+        # a bubble's \u2715 zone outranks the bubble body itself
+        for (hx, hy, hw, hh, kind, data) in self.hits:
+            if kind in ("notify_x", "resume_x", "flowclose") and \
+                    hx <= x <= hx + hw and hy <= y <= hy + hh:
+                return (kind, data, (hx, hy, hw, hh))
         if r._notif_rect and r._notif_active(time.monotonic()):
             hx, hy, hw, hh = r._notif_rect
             if hx <= x <= hx + hw and hy <= y <= hy + hh:
@@ -3150,7 +3637,27 @@ class Daemon:
         hit = self.touch["hit"]
         if hit and hit[0] == "slider":
             self._slider_to(hit[1], x, hit[2])
-        elif (self.view == "live" or (self.view == "dev" and self.dev_step == "harness")) \
+        elif self.view == "flow" and hit and hit[0] == "flowsess":
+            # Swipe-away (owner 2026-10-23): a quick left flick on a
+            # session bubble reveals its \u2715 instead of scrolling.
+            # A bubble-started drag holds its scroll until it proves
+            # to be a slow drag (>0.7 s), so a flick never scrolls
+            # the strip out from under the finger first.
+            age = time.monotonic() - self.touch["t"]
+            key = sess_key(hit[1])
+            if dx <= -56 and age <= 0.7:
+                self.touch["swiped"] = True
+                self._set_flow_close(key)
+            elif dx >= 40 and self.flow_close_key == key:
+                self.touch["swiped"] = True  # swipe back: hide the \u2715
+                self._set_flow_close(None)
+            elif self.touch.get("swiped"):
+                pass  # gesture already claimed: never becomes a scroll
+            elif age > 0.7 and abs(dx) > 6:
+                self.scroll = clamp(self.touch["scroll0"] - dx, 0,
+                                    max(self.max_scroll, 0))
+        elif (self.view in ("live", "flow")
+              or (self.view == "dev" and self.dev_step == "harness")) \
                 and abs(dx) > 6:
             self.scroll = clamp(self.touch["scroll0"] - dx, 0, max(self.max_scroll, 0))
 
@@ -3162,7 +3669,10 @@ class Daemon:
         self.renderer.set_touch(x, y, active=False)
         hit = self.touch["hit"]
         x0 = self.touch["x0"]
+        swiped = self.touch.get("swiped")
         self.touch = None
+        if swiped:
+            return  # a swipe only reveals/hides the \u2715; it never taps
         if not hit:
             return
         # Activate when the finger lifts on the SAME target it pressed
@@ -3176,10 +3686,45 @@ class Daemon:
         else:
             return  # genuine drag/scroll
         kind, data = hit[0], hit[1]
+        if kind == "flowclose":
+            # the revealed \u2715: close the session for real (window
+            # locally, tmux on its node remotely) and leave no ssh
+            # quick-resume suggestion behind
+            self._set_flow_close(None)
+            self.act.close_session(data)
+            return
         if kind == "dismiss":
             if abs(x - x0) <= 14:  # a tap, not a scroll across the field
                 self.renderer.notification = None
                 self.renderer._notif_rect = None
+            return
+        if kind == "notify_x":
+            # a bubble's \u2715: dismiss without jumping anywhere
+            self.renderer.notification = None
+            self.renderer._notif_rect = None
+            return
+        if kind == "resume_x":
+            # \u2715-out a quick-resume bubble: forget it, launch nothing
+            with self.st.lock:
+                self.st.closed_resumes = [
+                    e for e in self.st.closed_resumes
+                    if not (e.get("alias") == data.get("alias")
+                            and e.get("harness") == data.get("harness")
+                            and e.get("closed_at") == data.get("closed_at"))]
+                kept = list(self.st.closed_resumes)
+            if self.st.persist_resumes:
+                _resume_save(kept)
+            return
+        if kind == "flowsess":
+            # FLOW bubble -> LIVE with that session armed: a second
+            # tap, on its LIVE card, is what actually opens it
+            self.view = "live"
+            self.scroll = 0
+            self._set_flow_close(None)
+            self.live_sel = sess_key(data)
+            self.live_sel_at = time.monotonic()
+            self.renderer.live_sel = self.live_sel
+            self.renderer.live_sel_at = self.live_sel_at
             return
         if kind == "resume":
             # one tap back into a closed ssh session: relaunch its
@@ -3217,6 +3762,8 @@ class Daemon:
         elif kind == "view":
             self.view = data
             self.live_sel = None
+            self.dev_sel = None
+            self._set_flow_close(None)
             self.scroll = 0
         elif kind == "key":
             name, code = data
@@ -3260,15 +3807,39 @@ class Daemon:
                 self.act.focus_agent(data["pid"])
             self.pressed["agent"] = time.monotonic() + 0.2
         elif kind == "node":
+            # DEV two-tap, same discipline as LIVE: first tap arms
+            # the host card, second tap on it advances (stray
+            # touches must not start a launch workflow)
+            key = ("host", data.get("host") or "LOCAL")
+            if self.dev_sel != key:
+                self.dev_sel, self.dev_sel_at = key, time.monotonic()
+                self.renderer.dev_sel = key
+                self.renderer.dev_sel_at = self.dev_sel_at
+                return
             self.dev_node = None if data.get("host") is None else data
             self._set_dev_step("harness")
             self.view = "dev"  # arriving from fleet-nodes drill-down
         elif kind == "harness":
+            key = ("harness", data)
+            if self.dev_sel != key:
+                self.dev_sel, self.dev_sel_at = key, time.monotonic()
+                self.renderer.dev_sel = key
+                self.renderer.dev_sel_at = self.dev_sel_at
+                return
             self.dev_harness = data
             self._set_dev_step("confirm")
         elif kind == "devback":
             self._set_dev_step("host" if self.dev_step == "harness" else "harness")
         elif kind == "launch":
+            # launching is the consequential step: it arms too
+            key = ("launch", self.dev_harness,
+                   (self.dev_node or {}).get("name", "LOCAL"))
+            if self.dev_sel != key:
+                self.dev_sel, self.dev_sel_at = key, time.monotonic()
+                self.renderer.dev_sel = key
+                self.renderer.dev_sel_at = self.dev_sel_at
+                return
+            self.dev_sel = None
             node = self.dev_node
             self.act.launch_dev((node.get("ssh") or node["host"]) if node else None,
                                 node["name"] if node else "LOCAL",
@@ -3280,7 +3851,16 @@ class Daemon:
             self._set_dev_step("host")
             self.view = "flow"
 
+    def _set_flow_close(self, key):
+        """Arm/clear the FLOW swipe-revealed \u2715 (mirrored to the
+        renderer here and every frame in run())."""
+        self.flow_close_key = key
+        self.flow_close_at = time.monotonic() if key else 0.0
+        self.renderer.flow_close_key = key
+        self.renderer.flow_close_at = self.flow_close_at
+
     def _set_dev_step(self, step):
+        self.dev_sel = None  # changing step disarms any two-tap arm
         self.dev_step = step
         self._slide_t0 = time.monotonic()
         self.scroll = 0.0
@@ -3381,6 +3961,14 @@ class Daemon:
                 self.live_sel = None  # armed selection expires
             self.renderer.live_sel = self.live_sel
             self.renderer.live_sel_at = self.live_sel_at
+            if self.flow_close_key and t0 - self.flow_close_at > 6:
+                self.flow_close_key = None  # revealed \u2715 folds away
+            self.renderer.flow_close_key = self.flow_close_key
+            self.renderer.flow_close_at = self.flow_close_at
+            if self.dev_sel and t0 - self.dev_sel_at > 6:
+                self.dev_sel = None  # DEV arm expires like LIVE's
+            self.renderer.dev_sel = self.dev_sel
+            self.renderer.dev_sel_at = self.dev_sel_at
             self.renderer.dev_state = (self.dev_step, self.dev_node, self.dev_harness)
             slide_age = t0 - self._slide_t0
             self.renderer.slide_dx = int(170 * max(0.0, 1 - slide_age / 0.22) ** 2) \
@@ -3612,7 +4200,12 @@ def testpattern(seconds=90):
         disp.commit()
 
     draw()
-    fd = os.open("/dev/input/event1", os.O_RDONLY | os.O_NONBLOCK)
+    touch_path = find_touchbar_evdev()
+    if not touch_path:
+        log.write("no Touch Bar touchscreen\n")
+        log.close()
+        return
+    fd = os.open(touch_path, os.O_RDONLY | os.O_NONBLOCK)
     raw_x = raw_y = 0
     end = time.time() + seconds
     while time.time() < end:

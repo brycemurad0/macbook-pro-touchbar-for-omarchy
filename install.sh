@@ -27,12 +27,18 @@ if [ ! -x "$DEST/.venv/bin/python" ]; then
     'pipecat-ai[silero,moonshine,elevenlabs,google,openai,anthropic]'
 fi
 
-echo "==> uinput udev rule (key injection needs the input group device)"
+echo "==> uinput access (survives reboot; static node is otherwise 0600 root:root)"
 echo 'KERNEL=="uinput", GROUP="input", MODE="0660", TAG+="uaccess"' \
   | sudo tee /etc/udev/rules.d/99-omarchy-touchbar-uinput.rules >/dev/null
 sudo udevadm control --reload-rules
-sudo chmod 660 /dev/uinput 2>/dev/null || true
-sudo chgrp input /dev/uinput 2>/dev/null || true
+# kmod's static node is created 0600 before udev ever sees a device, so a
+# user open cannot autoload the module and the udev rule never runs.
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf >/dev/null
+printf '%s\n' '# Override /run/tmpfiles.d/static-nodes.conf (0600 root:root).' \
+  'c /dev/uinput 0660 root input - 10:223' \
+  | sudo tee /etc/tmpfiles.d/zz-omarchy-uinput.conf >/dev/null
+sudo modprobe uinput 2>/dev/null || true
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/zz-omarchy-uinput.conf
 
 echo "==> stop + mask tiny-dfr (reversible via restore.sh)"
 sudo systemctl stop tiny-dfr.service || true
